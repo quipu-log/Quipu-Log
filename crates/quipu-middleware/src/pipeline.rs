@@ -1,11 +1,12 @@
 use crate::event::AuditEvent;
 use crate::permissions::{Action, PermissionPolicy, Role};
-use quipu_core::storage::Table;
+use quipu_core::storage::{SegmentSlice, Table, TableScan};
 use quipu_core::{
-    AuditStore, CustomColumnDef, LogQuery, LogView, ReadSnapshot, TargetSnapshot, TypeSchema, Uid,
+    AuditLog, AuditStore, CustomColumnDef, LogQuery, LogView, ReadSnapshot, TargetSnapshot,
+    TypeSchema, Uid,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +47,21 @@ pub struct DlqEntry {
     pub event: AuditEvent,
     pub error: String,
     pub failed_at: u64,
+}
+
+/// Outcome of one tamper-evidence verification pass over the whole store
+/// (see [`AuditHandle::verify_integrity`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyReport {
+    /// `true` when every hash chain checked out.
+    pub ok: bool,
+    /// Segment files across all tables (logs, relations, meta, registries).
+    pub segments_checked: usize,
+    /// Rows readable in the audit-log table at verification time.
+    pub log_records: usize,
+    /// Chain breaks or read errors. The core verification stops at the first
+    /// break, so today this holds at most one entry.
+    pub problems: Vec<String>,
 }
 
 /// Called when an event could not be persisted and went to the DLQ (or the
@@ -105,6 +121,7 @@ enum Command {
     RedriveDlq(SyncSender<Result<usize, MiddlewareError>>),
     ApplyRetention(SyncSender<Result<usize, MiddlewareError>>),
     DlqLen(SyncSender<Result<usize, MiddlewareError>>),
+    VerifyIntegrity(SyncSender<Result<VerifyReport, MiddlewareError>>),
 }
 
 /// Cloneable, thread-safe handle the host application talks to. `emit` never
@@ -251,6 +268,21 @@ impl AuditHandle {
         self.check(role, Action::Administer)?;
         self.round_trip(Command::DlqLen)
     }
+
+    /// Verify the store's tamper-evidence hash chains (permission-gated,
+    /// [`Action::Administer`]). A found chain break comes back as a
+    /// [`VerifyReport`] with `ok: false`, not as `Err` — `Err` means the
+    /// verification itself could not be run.
+    ///
+    /// This is a full-store scan and it runs **on the writer thread** (the
+    /// core API needs `&mut` store access): while it runs, emits queue up in
+    /// the bounded channel instead of being persisted. Callers should make
+    /// sure only one verification runs at a time and call this from a
+    /// blocking-friendly context (`spawn_blocking` in async code).
+    pub fn verify_integrity(&self, role: &Role) -> Result<VerifyReport, MiddlewareError> {
+        self.check(role, Action::Administer)?;
+        self.round_trip(Command::VerifyIntegrity)
+    }
 }
 
 /// Owns the writer thread. Keep it alive as long as auditing should run; call
@@ -291,6 +323,7 @@ impl AuditPipeline {
         let (tx, rx) = sync_channel(cfg.queue_capacity);
         let worker = Worker {
             store,
+            store_root,
             dlq: Some(dlq),
             dlq_dir,
             cfg: cfg.clone(),
@@ -339,8 +372,68 @@ fn redrive_staging_dir(dlq_dir: &std::path::Path) -> PathBuf {
     dlq_dir.with_extension("redrive")
 }
 
+/// Collect every `seg-*.log` table segment under `root`, skipping the DLQ
+/// (and its redrive staging twin) — the DLQ is not part of the verified
+/// store. The name pattern mirrors quipu-core's on-disk table layout; it is
+/// only used for the report's `segments_checked` count.
+fn collect_segment_files(root: &Path, dlq_dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path == dlq_dir || path == redrive_staging_dir(dlq_dir) {
+                continue;
+            }
+            collect_segment_files(&path, dlq_dir, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("seg-") && n.ends_with(".log"))
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// Count the rows readable in the audit-log table right now. Runs on the
+/// worker thread straight after verification, so no append can race the
+/// scan. A row that fails to decode stops the count (it is also a `problem`
+/// in the report) — the number then reads as "records intact up to the
+/// break".
+fn count_log_records(root: &Path) -> usize {
+    let mut segments = Vec::new();
+    let logs_dir = root.join("logs");
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("seg-") && n.ends_with(".log"))
+            {
+                segments.push(path);
+            }
+        }
+    }
+    segments.sort();
+    let slices = segments
+        .into_iter()
+        .map(|path| SegmentSlice {
+            path,
+            bound: u64::MAX,
+        })
+        .collect();
+    TableScan::<AuditLog>::over(slices)
+        .map_while(|r| r.ok())
+        .count()
+}
+
 struct Worker {
     store: AuditStore,
+    /// Store directory — used by verification to count segment files.
+    store_root: PathBuf,
     /// `None` only transiently, mid-redrive-swap or after a failed reopen;
     /// [`Worker::dlq`] lazily reopens in that case.
     dlq: Option<Table<DlqEntry>>,
@@ -450,6 +543,30 @@ impl Worker {
                 })();
                 let _ = reply.send(res);
             }
+            Command::VerifyIntegrity(reply) => {
+                let _ = reply.send(Ok(self.verify()));
+            }
+        }
+    }
+
+    /// Recompute every table's hash chain (logs, relations, meta,
+    /// registries) and report what was checked. A chain break or read error
+    /// becomes a `problem` in the report instead of failing the call — the
+    /// caller wants "is the store intact?", and "could not even read it" is
+    /// just the loudest possible "no".
+    fn verify(&mut self) -> VerifyReport {
+        let problems = match self.store.verify_integrity() {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![e.to_string()],
+        };
+        let mut segments = Vec::new();
+        collect_segment_files(&self.store_root, &self.dlq_dir, &mut segments);
+        let log_records = count_log_records(&self.store_root);
+        VerifyReport {
+            ok: problems.is_empty(),
+            segments_checked: segments.len(),
+            log_records,
+            problems,
         }
     }
 

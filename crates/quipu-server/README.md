@@ -56,11 +56,14 @@ cargo run -p quipu-server -- config.json
       "admin": ["emit", "query", "administer"]
     },
     "max_concurrent_queries": 2
-  }
+  },
+  "verify": { "interval_secs": 86400 }
 }
 ```
 
 - `sync_policy`: `"always"`, `"os_managed"`, or `{ "every_n": N }`.
+- `verify` (optional): periodic [integrity verification](#integrity-verification) —
+  one pass at startup, then one per `interval_secs`. Omit to disable.
 - Key material is always referenced by file path, never inlined.
 - Auth is deny-by-default: a role with no grants can do nothing.
   Run one token per calling service so tokens can be revoked individually.
@@ -156,6 +159,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 All endpoints except `/v1/healthz` require `Authorization: Bearer <token>`.
 Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 403 (role lacks the action), 400 (schema/crypto misuse), 404,
+409 (a verification is already running — retry later),
 429 (token at its concurrent-query cap — retry when a query finishes),
 503 (append queue full — back off and retry), or 500.
 
@@ -173,6 +177,7 @@ Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 | `POST /v1/admin/redrive` | administer | `{"redriven": n}` |
 | `POST /v1/admin/retention` | administer | `{"segments_dropped": n}` |
 | `GET /v1/admin/dlq` | administer | `{"parked": n}` |
+| `POST /v1/admin/verify` | administer | verify report (below); **409** while another verification runs |
 
 A 202 means *queued*, not durable —
 durability is the pipeline's job (retries, then the DLQ; nothing is silently dropped).
@@ -240,6 +245,55 @@ curl -s -X POST localhost:7700/v1/types \
 ```
 
 Same rules as embedded `define_type`: redefinition is additive only.
+
+## Integrity verification
+
+Every table is a hash chain (`sha256(previous chain value || payload)`,
+seeded across segment boundaries), so in-place edits and removed or
+replaced segments are detectable after the fact. The embedded API has
+`AuditStore::verify_integrity()`; the server exposes the same check two ways:
+
+**On demand** — `POST /v1/admin/verify` (administer):
+
+```sh
+curl -s -X POST localhost:7700/v1/admin/verify \
+  -H 'Authorization: Bearer adm1n-t0ken'
+```
+
+```json
+{
+  "ok": true,
+  "segments_checked": 7,
+  "log_records": 1843,
+  "problems": []
+}
+```
+
+A found chain break is a *successful* verification: still 200, with
+`"ok": false` and the break described in `problems` (verification stops at
+the first break, so it lists at most one). Only "could not verify at all"
+is an error status.
+
+**Periodic** — add a `verify` section to the config:
+
+```json
+"verify": { "interval_secs": 86400 }
+```
+
+One pass runs at startup, then one per interval. A pass that finds a break —
+or cannot run — logs at `error` level; point your alerting at that line.
+Omit the section to disable (the endpoint works either way).
+
+Two things to know before pointing a cron at it:
+
+- At most one verification runs at a time, shared between the endpoint and
+  the periodic task: the endpoint answers **409** while one is running, the
+  periodic task skips its tick with a warning.
+- Verification re-reads every segment **on the writer thread** (the chains
+  live under the store's single-writer lock). While it runs, appends queue
+  up in the bounded pipeline queue instead of being persisted — fine for
+  typical stores, but on a very large store under heavy write load, schedule
+  it off-peak or expect some 503s on `POST /v1/logs` during the pass.
 
 ## Limits (v1, by design)
 
