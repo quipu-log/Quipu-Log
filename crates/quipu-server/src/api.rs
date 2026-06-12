@@ -186,8 +186,7 @@ impl AppState {
             .expect("system clock before 1970")
             .as_secs();
         let auth = self.auth.read().unwrap();
-        let (role, token_hash) =
-            role_for(headers, &auth.tokens, now).ok_or_else(unauthorized)?;
+        let (role, token_hash) = role_for(headers, &auth.tokens, now).ok_or_else(unauthorized)?;
         if !auth.policy.is_allowed(&role, action) {
             return Err(MiddlewareError::PermissionDenied { role, action }.into());
         }

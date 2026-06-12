@@ -14,7 +14,9 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod serve;
 
 pub use api::{router, AppState, QuerySlot};
-pub use auth::{sha256_hex, AuthState};
+pub use auth::{sha256_hex, AuthState, TokenMap};
 pub use config::ServerConfig;
+pub use serve::{bind, serve};

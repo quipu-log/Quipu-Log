@@ -78,14 +78,15 @@ async fn main() {
         let state = state.clone();
         let path = std::path::PathBuf::from(&config_path);
         tokio::spawn(async move {
-            let mut hup =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(error = %e, "cannot install SIGHUP handler; auth hot-reload disabled");
-                        return;
-                    }
-                };
+            let mut hup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot install SIGHUP handler; auth hot-reload disabled");
+                    return;
+                }
+            };
             while hup.recv().await.is_some() {
                 if let Err(e) = state.reload_auth(&path) {
                     tracing::error!(error = %e, "auth reload failed; keeping previous auth config");
@@ -94,20 +95,21 @@ async fn main() {
         });
     }
 
-    let listener = match tokio::net::TcpListener::bind(&cfg.listen).await {
+    let listener = match quipu_server::bind(&cfg.listen) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("failed to bind '{}': {e}", cfg.listen);
             std::process::exit(1);
         }
     };
-    tracing::info!(listen = %cfg.listen, "quipu-server listening");
+    tracing::info!(listen = %cfg.listen, tls = cfg.tls.is_some(), "quipu-server listening");
 
-    let serve = axum::serve(listener, router(state)).with_graceful_shutdown(async {
+    let result = quipu_server::serve(listener, cfg.tls.as_ref(), router(state), async {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutdown signal received");
-    });
-    if let Err(e) = serve.await {
+    })
+    .await;
+    if let Err(e) = result {
         tracing::error!(error = %e, "server error");
     }
 
