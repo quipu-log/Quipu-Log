@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/audit-core",
-    "crates/audit-middleware",
+    "crates/quipu-core",
+    "crates/quipu-middleware",
     "examples/axum-demo",
 ]
 
@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/draft-dhgo/audit-logger"
+repository = "https://github.com/draft-dhgo/quipu"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

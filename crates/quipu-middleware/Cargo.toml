@@ -1,5 +1,5 @@
 [package]
-name = "audit-middleware"
+name = "quipu-middleware"
 description = "Async audit-logging middleware: event pipeline with DLQ and fallback, programmable pre/post filters, permissions, and a tower proxy layer."
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-audit-core = { path = "../audit-core" }
+quipu-core = { path = "../quipu-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -1,5 +1,5 @@
-use audit_core::*;
-use audit_middleware::*;
+use quipu_core::*;
+use quipu_middleware::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 

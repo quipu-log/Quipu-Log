@@ -6,8 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-audit-core = { path = "../../crates/audit-core" }
-audit-middleware = { path = "../../crates/audit-middleware" }
+quipu-core = { path = "../../crates/quipu-core" }
+quipu-middleware = { path = "../../crates/quipu-middleware" }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

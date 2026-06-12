@@ -1,4 +1,4 @@
-use audit_core::*;
+use quipu_core::*;
 use std::collections::BTreeMap;
 
 fn open_store(root: &std::path::Path) -> AuditStore {
@@ -405,7 +405,7 @@ fn type_redefinition_guard_rejects_breaking_changes() {
 fn required_custom_column_is_not_retroactive() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = open_store(dir.path());
-    let before = audit_core::time::now_micros() - 1_000_000; // 1s in the past
+    let before = quipu_core::time::now_micros() - 1_000_000; // 1s in the past
     store
         .define_custom_column(CustomColumnDef::new("reason", ValueKind::Text).required())
         .unwrap();

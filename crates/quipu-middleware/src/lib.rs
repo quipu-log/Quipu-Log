@@ -1,6 +1,6 @@
-//! # audit-middleware
+//! # quipu-middleware
 //!
-//! Async audit-logging middleware on top of [`audit_core`]:
+//! Async audit-logging middleware on top of [`quipu_core`]:
 //!
 //! - [`pipeline`]: event-driven, non-blocking writer with retries, a
 //!   disk-backed dead-letter queue and a programmable fallback hook

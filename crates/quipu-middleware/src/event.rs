@@ -1,4 +1,4 @@
-use audit_core::{Content, EntityInput, Value};
+use quipu_core::{Content, EntityInput, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -44,7 +44,7 @@ impl AuditEvent {
         content: Content,
     ) -> Self {
         Self {
-            occurred_at: audit_core::time::now_micros(),
+            occurred_at: quipu_core::time::now_micros(),
             actor_type: actor_type.into(),
             actor,
             method: method.into(),

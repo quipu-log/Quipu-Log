@@ -1,8 +1,8 @@
-use audit_core::*;
-use audit_middleware::*;
 use axum::routing::{get, put};
 use axum::Router;
 use http::Method;
+use quipu_core::*;
+use quipu_middleware::*;
 use tower::ServiceExt;
 
 fn store_at(root: &std::path::Path) -> AuditStore {

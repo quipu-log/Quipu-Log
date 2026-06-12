@@ -7,18 +7,18 @@
 //! curl 'localhost:3000/audit/logs?name=doc-42'
 //! ```
 
-use audit_core::*;
-use audit_middleware::*;
 use axum::extract::{Query, State};
 use axum::http::Method;
 use axum::routing::{get, put};
 use axum::{Json, Router};
+use quipu_core::*;
+use quipu_middleware::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    let root = std::env::temp_dir().join("audit-logger-demo");
+    let root = std::env::temp_dir().join("quipu-demo");
     let cfg = StoreConfig::new(&root)
         .retention(RetentionPolicy::days(90))
         .sync_policy(SyncPolicy::EveryN(32));

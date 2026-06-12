@@ -1,11 +1,11 @@
 use crate::event::{AuditEvent, TargetSpec};
 use crate::filter::{FilterDecision, FilterSet, RequestInfo, ResponseInfo};
 use crate::pipeline::AuditHandle;
-use audit_core::{Content, EntityInput};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
+use quipu_core::{Content, EntityInput};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;

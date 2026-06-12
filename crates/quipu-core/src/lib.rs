@@ -1,4 +1,4 @@
-//! # audit-core
+//! # quipu-core
 //!
 //! Embedded, OS-independent audit-log storage engine.
 //!
@@ -9,7 +9,7 @@
 //! - Custom audit-log columns (text / number / json) managed through a registry
 //! - Retention windows enforced by whole-segment drops
 //!
-//! The async event pipeline, filters, DLQ and HTTP proxy live in `audit-middleware`;
+//! The async event pipeline, filters, DLQ and HTTP proxy live in `quipu-middleware`;
 //! this crate is the synchronous storage and query core underneath it.
 
 pub mod crypto;

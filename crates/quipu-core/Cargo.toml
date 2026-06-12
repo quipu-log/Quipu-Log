@@ -1,5 +1,5 @@
 [package]
-name = "audit-core"
+name = "quipu-core"
 description = "Embedded, OS-independent audit log storage engine: typed entity registries, field encryption, retention, and time-travel queries."
 version.workspace = true
 edition.workspace = true

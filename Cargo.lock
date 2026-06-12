@@ -50,40 +50,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "audit-core"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "bincode",
- "crc32fast",
- "hmac",
- "rand",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "audit-middleware"
-version = "0.1.0"
-dependencies = [
- "audit-core",
- "axum",
- "bytes",
- "http",
- "http-body",
- "http-body-util",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,9 +111,9 @@ dependencies = [
 name = "axum-demo"
 version = "0.1.0"
 dependencies = [
- "audit-core",
- "audit-middleware",
  "axum",
+ "quipu-core",
+ "quipu-middleware",
  "serde_json",
  "tokio",
  "tower",
@@ -735,6 +701,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quipu-core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "bincode",
+ "crc32fast",
+ "hmac",
+ "rand",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "quipu-middleware"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "quipu-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

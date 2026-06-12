@@ -1,7 +1,7 @@
 use crate::event::AuditEvent;
 use crate::permissions::{Action, PermissionPolicy, Role};
-use audit_core::storage::Table;
-use audit_core::{AuditStore, LogQuery, LogView, ReadSnapshot, TargetSnapshot, TypeSchema, Uid};
+use quipu_core::storage::Table;
+use quipu_core::{AuditStore, LogQuery, LogView, ReadSnapshot, TargetSnapshot, TypeSchema, Uid};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -20,7 +20,7 @@ pub enum MiddlewareError {
     },
     /// The worker thread has stopped.
     WorkerGone,
-    Core(audit_core::Error),
+    Core(quipu_core::Error),
 }
 
 impl std::fmt::Display for MiddlewareError {
@@ -269,7 +269,7 @@ impl AuditPipeline {
         let join = std::thread::Builder::new()
             .name("audit-writer".into())
             .spawn(move || worker.run(rx))
-            .map_err(|e| MiddlewareError::Core(audit_core::Error::Io(e)))?;
+            .map_err(|e| MiddlewareError::Core(quipu_core::Error::Io(e)))?;
         Ok(Self {
             handle: AuditHandle {
                 tx,
@@ -411,15 +411,15 @@ impl Worker {
 
     /// Lazily (re)open the DLQ table — it is detached briefly during the
     /// redrive directory swap.
-    fn dlq(&mut self) -> audit_core::Result<&mut Table<DlqEntry>> {
+    fn dlq(&mut self) -> quipu_core::Result<&mut Table<DlqEntry>> {
         if self.dlq.is_none() {
             self.dlq = Some(Table::open(&self.dlq_dir, DLQ_SEGMENT_BYTES)?);
         }
         Ok(self.dlq.as_mut().expect("just opened"))
     }
 
-    fn try_write(&mut self, event: &AuditEvent) -> Result<Uid, audit_core::Error> {
-        let targets: Vec<(String, audit_core::EntityInput)> = event
+    fn try_write(&mut self, event: &AuditEvent) -> Result<Uid, quipu_core::Error> {
+        let targets: Vec<(String, quipu_core::EntityInput)> = event
             .targets
             .iter()
             .map(|t| (t.entity_type.clone(), t.input.clone()))
@@ -462,7 +462,7 @@ impl Worker {
         let entry = DlqEntry {
             event,
             error: error.clone(),
-            failed_at: audit_core::time::now_micros(),
+            failed_at: quipu_core::time::now_micros(),
         };
         let dlq_result = self.dlq().and_then(|dlq| {
             dlq.append(&entry, entry.failed_at)?;
@@ -523,7 +523,7 @@ impl Worker {
                     let entry = DlqEntry {
                         event: entry.event,
                         error: error.clone(),
-                        failed_at: audit_core::time::now_micros(),
+                        failed_at: quipu_core::time::now_micros(),
                     };
                     staging
                         .append(&entry, entry.failed_at)
