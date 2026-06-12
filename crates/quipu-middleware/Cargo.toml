@@ -22,3 +22,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 axum = { workspace = true }
+criterion = "0.5"
+
+[[bench]]
+name = "write_path"
+harness = false
