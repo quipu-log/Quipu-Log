@@ -38,4 +38,6 @@ pub use schema::{
     default_actor_type, default_target_type, CustomColumnDef, FieldDef, FieldIndex,
     FieldProtection, TypeSchema,
 };
-pub use store::{AnchorHook, AuditStore, ReadSnapshot, StoreConfig, SyncPolicy};
+pub use store::{
+    AnchorHook, AuditStore, ReadSnapshot, RekeyEvent, RekeyedTable, StoreConfig, SyncPolicy,
+};

@@ -702,6 +702,16 @@ impl TypeRegistry {
     pub fn verify(&mut self) -> Result<()> {
         self.table.verify()
     }
+
+    /// Whether `target` is a chain value (or segment seed) of this registry's
+    /// version log — used to verify that the chain head signed by the latest
+    /// re-key event still exists in the chain.
+    pub(crate) fn contains_chain_value(
+        &mut self,
+        target: &crate::storage::ChainHash,
+    ) -> Result<bool> {
+        self.table.contains_chain_value(target)
+    }
 }
 
 /// Search key for an on-disk value: plain values use canonical bytes, hashed
