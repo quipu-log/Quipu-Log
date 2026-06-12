@@ -421,6 +421,99 @@ async fn concurrent_query_limit() {
 }
 
 #[tokio::test]
+async fn verify_endpoint_reports_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, pipeline) = test_state(dir.path(), default_tokens(), None);
+    let app = router(state.clone());
+
+    // seed one durable log so verification has chains to walk
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs",
+        Some("writer-token"),
+        Some(append_body("alice", "/api/things")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let (status, _) = send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // verify is administer-gated
+    let (status, _) = send(&app, "POST", "/v1/admin/verify", Some("reader-token"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(&app, "POST", "/v1/admin/verify", Some("writer-token"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // a clean store verifies green
+    let (status, body) = send(&app, "POST", "/v1/admin/verify", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    assert!(body["segments_checked"].as_u64().unwrap() > 0, "{body}");
+    assert_eq!(body["log_records"], 1, "{body}");
+    assert_eq!(body["problems"].as_array().unwrap().len(), 0);
+
+    // while a verification holds the slot, a second one is refused
+    let held = state.try_begin_verify().expect("slot should be free");
+    let (status, _) = send(&app, "POST", "/v1/admin/verify", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    drop(held);
+    let (status, _) = send(&app, "POST", "/v1/admin/verify", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // flip one payload byte in a logs segment: tampering must be reported,
+    // as a 200 with ok:false (the verification itself succeeded)
+    let logs_dir = dir.path().join("logs");
+    let seg = std::fs::read_dir(&logs_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "log"))
+        .expect("a logs segment exists");
+    let mut bytes = std::fs::read(&seg).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&seg, bytes).unwrap();
+
+    let (status, body) = send(&app, "POST", "/v1/admin/verify", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false, "{body}");
+    assert!(!body["problems"].as_array().unwrap().is_empty(), "{body}");
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn periodic_verify_runs_on_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, pipeline) = test_state(dir.path(), default_tokens(), None);
+
+    let task =
+        quipu_server::spawn_periodic_verify(state.clone(), std::time::Duration::from_millis(5));
+
+    // one pass fires at startup, the next proves the loop ticks
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.verify_runs() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "periodic verify never completed two passes"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    task.abort();
+    pipeline.shutdown();
+}
+
+#[tokio::test]
 async fn auth_reload_swaps_tokens_and_survives_bad_config() {
     let dir = tempfile::tempdir().unwrap();
     let store_root = dir.path().join("store");

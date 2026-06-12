@@ -17,6 +17,9 @@ pub struct ServerConfig {
     pub auth: AuthSection,
     /// Omit to serve plain HTTP (e.g. behind a TLS-terminating proxy).
     pub tls: Option<TlsSection>,
+    /// Periodic integrity verification. Omit to disable (the
+    /// `POST /v1/admin/verify` endpoint works either way).
+    pub verify: Option<VerifySection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +67,15 @@ pub struct TlsSection {
     pub cert_pem_file: PathBuf,
     /// Private key for the certificate (PKCS#8/PKCS#1/SEC1 PEM).
     pub key_pem_file: PathBuf,
+}
+
+/// Background tamper-evidence verification of the whole store.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifySection {
+    /// Seconds between verification passes (the first pass runs at startup).
+    /// A pass that finds a chain break — or cannot run — logs at `error`.
+    pub interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]

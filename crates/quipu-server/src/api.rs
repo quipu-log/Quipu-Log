@@ -6,11 +6,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use quipu_core::{Content, CustomColumnDef, EntityInput, LogQuery, TypeSchema, Value};
-use quipu_middleware::{Action, AuditEvent, AuditHandle, MiddlewareError, Role, TargetSpec};
+use quipu_middleware::{
+    Action, AuditEvent, AuditHandle, MiddlewareError, Role, TargetSpec, VerifyReport,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
@@ -25,6 +28,13 @@ pub struct AppState {
     /// a changed cap takes effect (in-flight permits stay on the old
     /// semaphores and just drain out).
     query_slots: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    /// True while an integrity verification runs. Verification is a
+    /// full-store scan on the writer thread, so the endpoint and the periodic
+    /// task share this guard to keep it to one pass at a time.
+    verify_running: Arc<AtomicBool>,
+    /// Completed verification passes since startup (endpoint + periodic) —
+    /// an observability counter, also what tests poll.
+    verify_runs: Arc<AtomicU64>,
 }
 
 /// One reserved unit of a token's concurrent-query budget.
@@ -43,7 +53,25 @@ impl AppState {
             handle,
             auth: Arc::new(RwLock::new(auth)),
             query_slots: Arc::new(Mutex::new(HashMap::new())),
+            verify_running: Arc::new(AtomicBool::new(false)),
+            verify_runs: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Claim the single verification slot. `None` while a verification is
+    /// already running (the HTTP layer answers 409); the slot frees itself
+    /// when the returned guard drops. Public so tests can occupy it
+    /// deterministically.
+    pub fn try_begin_verify(&self) -> Option<VerifyGuard> {
+        self.verify_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| VerifyGuard(self.verify_running.clone()))
+    }
+
+    /// Verification passes completed since startup (endpoint + periodic).
+    pub fn verify_runs(&self) -> u64 {
+        self.verify_runs.load(Ordering::Acquire)
     }
 
     /// Re-read `path` and swap in its `auth` section. On any error (I/O,
@@ -99,6 +127,16 @@ impl AppState {
     }
 }
 
+/// The claimed verification slot (see [`AppState::try_begin_verify`]);
+/// dropping it lets the next verification start.
+pub struct VerifyGuard(Arc<AtomicBool>);
+
+impl Drop for VerifyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/healthz", get(healthz))
@@ -115,6 +153,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/redrive", post(admin_redrive))
         .route("/v1/admin/retention", post(admin_retention))
         .route("/v1/admin/dlq", get(admin_dlq))
+        .route("/v1/admin/verify", post(admin_verify))
         .with_state(state)
 }
 
@@ -377,4 +416,82 @@ async fn admin_dlq(
     let handle = state.handle.clone();
     let n = blocking(move || handle.dlq_len(&role)).await?;
     Ok(Json(serde_json::json!({ "parked": n })))
+}
+
+/// Verify the store's tamper-evidence hash chains. A found chain break is a
+/// *successful* verification: 200 with `"ok": false` and the problem listed —
+/// only "could not verify at all" is an error status. At most one
+/// verification runs at a time (shared with the periodic task); a second
+/// request gets 409 and should retry later.
+async fn admin_verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<VerifyReport>, ApiError> {
+    let role = state.authorize(&headers, Action::Administer)?.role;
+    let Some(guard) = state.try_begin_verify() else {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "an integrity verification is already running".into(),
+        });
+    };
+    let handle = state.handle.clone();
+    // full-store scan: run it in the blocking pool, holding the guard until
+    // the scan finishes
+    let report = blocking(move || {
+        let _running = guard;
+        handle.verify_integrity(&role)
+    })
+    .await?;
+    state.verify_runs.fetch_add(1, Ordering::AcqRel);
+    Ok(Json(report))
+}
+
+/// Background verification loop (config section `verify`): one pass at
+/// startup, then one per `interval`. A pass that finds a chain break — or
+/// cannot run — logs at `error`; that log line is the alerting hook. Skips a
+/// tick (at `warn`) when a verification is already running.
+pub fn spawn_periodic_verify(state: AppState, interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // the pipeline behind AppState enforces nothing (the HTTP layer
+        // does), so this internal identity is only a label in error messages
+        let role = Role::new("periodic-verify");
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Some(guard) = state.try_begin_verify() else {
+                tracing::warn!("periodic verify skipped: a verification is already running");
+                continue;
+            };
+            let handle = state.handle.clone();
+            let role = role.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _running = guard;
+                handle.verify_integrity(&role)
+            })
+            .await;
+            match result {
+                Ok(Ok(report)) => {
+                    state.verify_runs.fetch_add(1, Ordering::AcqRel);
+                    if report.ok {
+                        tracing::info!(
+                            segments = report.segments_checked,
+                            log_records = report.log_records,
+                            "periodic integrity verification passed"
+                        );
+                    } else {
+                        tracing::error!(
+                            problems = ?report.problems,
+                            segments = report.segments_checked,
+                            "integrity verification FAILED — the store shows tampering or corruption"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "periodic integrity verification could not run")
+                }
+                Err(e) => tracing::error!(error = %e, "periodic verify task panicked"),
+            }
+        }
+    })
 }

@@ -95,6 +95,19 @@ async fn main() {
         });
     }
 
+    // periodic integrity verification (opt-in `verify` config section);
+    // tamper findings surface as `error` log lines
+    if let Some(verify) = &cfg.verify {
+        quipu_server::spawn_periodic_verify(
+            state.clone(),
+            std::time::Duration::from_secs(verify.interval_secs),
+        );
+        tracing::info!(
+            interval_secs = verify.interval_secs,
+            "periodic integrity verification enabled"
+        );
+    }
+
     let listener = match quipu_server::bind(&cfg.listen) {
         Ok(l) => l,
         Err(e) => {
