@@ -19,3 +19,5 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# tests build a public-key-only KeyRing (write-only deployment) from PEM
+rsa = { workspace = true }

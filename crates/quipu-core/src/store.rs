@@ -1,3 +1,4 @@
+use crate::checkpoint::{Checkpoint, CheckpointLog};
 use crate::crypto::KeyRing;
 use crate::error::{Error, Result};
 use crate::id::Uid;
@@ -10,6 +11,11 @@ use crate::storage::{SegmentSlice, Table, TableScan};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// External-anchor callback — receives every checkpoint right after it is
+/// persisted. `Arc` (not `Box`) because [`StoreConfig`] is `Clone`.
+pub type AnchorHook = Arc<dyn Fn(&Checkpoint) + Send + Sync>;
 
 /// Durability/throughput trade-off for log appends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +43,12 @@ pub struct StoreConfig {
     /// deliberate trade-off the operator must choose; when off, Contains on
     /// protected fields is rejected (plain fields are always LIKE-searchable).
     pub plaintext_cache: bool,
+    /// Called with each integrity checkpoint after it is persisted, so its
+    /// chain head can be exported to an external trust domain (another host,
+    /// a ticket, a transparency log) that a disk-level insider cannot rewrite.
+    /// Errors and panics inside the hook are swallowed: availability of the
+    /// write path outranks anchoring — export delivery is the hook's job.
+    pub anchor: Option<AnchorHook>,
 }
 
 impl StoreConfig {
@@ -48,7 +60,14 @@ impl StoreConfig {
             retention: RetentionPolicy::KeepForever,
             keys: KeyRing::new(),
             plaintext_cache: false,
+            anchor: None,
         }
+    }
+
+    /// Register the external-anchor hook — see [`anchor`](Self::anchor).
+    pub fn anchor(mut self, hook: impl Fn(&Checkpoint) + Send + Sync + 'static) -> Self {
+        self.anchor = Some(Arc::new(hook));
+        self
     }
 
     /// Enable the in-memory plaintext cache — see
@@ -103,6 +122,7 @@ pub struct AuditStore {
     relations: Table<TargetRelation>,
     registries: HashMap<String, TypeRegistry>,
     custom_columns: HashMap<String, CustomColumnDef>,
+    checkpoints: CheckpointLog,
     appends_since_sync: u32,
     /// Advisory OS lock on `root/LOCK`, held for the store's lifetime. The
     /// store is single-process by design; without this, a second process
@@ -149,6 +169,7 @@ impl AuditStore {
                 }
             }
         }
+        let checkpoints = CheckpointLog::new(&cfg.root);
         Ok(Self {
             cfg,
             meta,
@@ -156,6 +177,7 @@ impl AuditStore {
             relations,
             registries,
             custom_columns,
+            checkpoints,
             appends_since_sync: 0,
             _lock: lock,
         })
@@ -386,7 +408,9 @@ impl AuditStore {
             content,
             custom,
         };
+        let seq_before = self.logs.active_seq();
         self.logs.append(&log, log.timestamp)?;
+        let sealed_a_segment = self.logs.active_seq() != seq_before;
         for (entity_type, uid) in targets {
             let rel = TargetRelation {
                 log_id: log.log_id,
@@ -396,6 +420,13 @@ impl AuditStore {
             self.relations.append(&rel, log.timestamp)?;
         }
         self.apply_sync_policy()?;
+        if sealed_a_segment {
+            // checkpoint on segment seal, not on flush/sync: a seal is when a
+            // chain prefix becomes immutable, and its frequency is bounded by
+            // segment size instead of putting an RSA signing operation on the
+            // every-N-appends sync path
+            self.write_checkpoint()?;
+        }
         Ok(log.log_id)
     }
 
@@ -469,12 +500,81 @@ impl AuditStore {
     /// Verify the tamper-evidence hash chains of every table (logs, relations,
     /// meta, all registries). Returns the first chain break found — a record
     /// that was modified in place, or a segment that was removed/replaced.
+    ///
+    /// If signed checkpoints exist (see [`checkpoint`](Self::checkpoint)),
+    /// they are verified too: every checkpoint signature must check out
+    /// against the public key, and the latest checkpoint's chain head must
+    /// still exist in the log chain. That extends detection to attacks the
+    /// chain alone cannot see — deleting everything and rewriting a
+    /// self-consistent chain from scratch, or truncating the newest records.
     pub fn verify_integrity(&mut self) -> Result<()> {
         self.logs.verify()?;
         self.relations.verify()?;
         self.meta.verify()?;
         for reg in self.registries.values_mut() {
             reg.verify()?;
+        }
+        self.verify_checkpoints()
+    }
+
+    // ---- integrity checkpoints --------------------------------------------
+
+    /// Sign and persist an integrity checkpoint of the log chain now, on top
+    /// of the automatic ones (segment seals and retention runs). Returns
+    /// `Ok(None)` when the [`KeyRing`] holds no RSA private key: write-only
+    /// deployments cannot sign, so checkpointing is silently disabled rather
+    /// than an error — appends must keep working there.
+    pub fn checkpoint(&mut self) -> Result<Option<Checkpoint>> {
+        self.write_checkpoint()
+    }
+
+    /// Every checkpoint recorded so far, oldest first.
+    pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
+        self.checkpoints.read_all()
+    }
+
+    fn write_checkpoint(&mut self) -> Result<Option<Checkpoint>> {
+        if !self.cfg.keys.can_sign() {
+            return Ok(None);
+        }
+        // a checkpoint must never claim a head that is less durable than the
+        // checkpoint file itself — fsync the logs before signing (cheap: this
+        // runs per segment seal / retention run, not per append)
+        self.logs.sync()?;
+        let cp = Checkpoint::sign(
+            &self.cfg.keys,
+            crate::time::now_micros(),
+            self.logs.active_seq(),
+            self.logs.record_count(),
+            self.logs.chain_head(),
+        )?;
+        self.checkpoints.append(&cp)?;
+        if let Some(hook) = &self.cfg.anchor {
+            // a broken anchor must not take down the write path
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(&cp)));
+        }
+        Ok(Some(cp))
+    }
+
+    fn verify_checkpoints(&mut self) -> Result<()> {
+        let cps = self.checkpoints.read_all()?;
+        let Some(latest) = cps.last() else {
+            return Ok(()); // never checkpointed (e.g. write-only deployment)
+        };
+        for cp in &cps {
+            cp.verify(&self.cfg.keys)?;
+        }
+        // only the latest head is matched against the chain: older heads may
+        // legitimately live in segments retention has unlinked, and every
+        // count-reducing operation writes a fresh checkpoint
+        if !self.logs.contains_chain_value(&latest.chain_head)? {
+            return Err(Error::Corrupt {
+                segment: self.checkpoints.path().display().to_string(),
+                offset: 0,
+                reason: "latest checkpoint's chain head is absent from the log chain — the \
+                         chain was rewritten or truncated after the checkpoint was signed"
+                    .into(),
+            });
         }
         Ok(())
     }
@@ -488,6 +588,12 @@ impl AuditStore {
         };
         let mut dropped = self.logs.purge_older_than(cutoff)?;
         dropped += self.relations.purge_older_than(cutoff)?;
+        if dropped > 0 {
+            // re-anchor after the unlink: the previous latest checkpoint may
+            // point into a purged segment, and verification must not depend
+            // on records that retention legitimately removed
+            self.write_checkpoint()?;
+        }
         Ok(dropped)
     }
 

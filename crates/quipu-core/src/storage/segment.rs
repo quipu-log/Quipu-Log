@@ -42,6 +42,9 @@ pub struct Skim {
     /// Length of the valid prefix (header + whole, CRC-clean frames).
     pub valid_len: u64,
     pub max_timestamp: u64,
+    /// Number of valid frames; feeds the table-level record count that
+    /// integrity checkpoints attest to.
+    pub records: u64,
     /// Chain value stored in the last valid frame (the header seed if none).
     pub last_chain: ChainHash,
 }
@@ -53,6 +56,7 @@ pub struct Segment {
     len: u64,
     /// Highest record timestamp in the file; drives retention decisions.
     pub max_timestamp: u64,
+    records: u64,
     last_chain: ChainHash,
 }
 
@@ -81,6 +85,7 @@ impl Segment {
                     writer,
                     len: s.valid_len,
                     max_timestamp: s.max_timestamp,
+                    records: s.records,
                     last_chain: s.last_chain,
                 })
             }
@@ -96,6 +101,7 @@ impl Segment {
                     writer,
                     len: SEGMENT_HEADER as u64,
                     max_timestamp: 0,
+                    records: 0,
                     last_chain: seed,
                 })
             }
@@ -119,6 +125,11 @@ impl Segment {
         self.last_chain
     }
 
+    /// Number of records in this segment.
+    pub fn records(&self) -> u64 {
+        self.records
+    }
+
     /// Append one framed payload. Returns the offset the record starts at.
     /// Data lands in the buffer; call [`flush`]/[`sync`] per the durability policy.
     pub fn append(&mut self, payload: &[u8], timestamp: u64) -> Result<u64> {
@@ -139,6 +150,7 @@ impl Segment {
         self.writer.write_all(payload)?;
         self.len += (FRAME_HEADER + payload.len()) as u64;
         self.max_timestamp = self.max_timestamp.max(timestamp);
+        self.records += 1;
         self.last_chain = chain;
         Ok(offset)
     }
@@ -200,6 +212,7 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
     let (_, seed) = read_header(&mut reader, path)?;
     let mut valid = SEGMENT_HEADER as u64;
     let mut max_ts = 0u64;
+    let mut records = 0u64;
     let mut last_chain = seed;
     let mut header = [0u8; FRAME_HEADER];
     let mut buf = Vec::new();
@@ -222,11 +235,13 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
         }
         valid += (FRAME_HEADER + len as usize) as u64;
         max_ts = max_ts.max(ts);
+        records += 1;
         last_chain = chain;
     }
     Ok(Some(Skim {
         valid_len: valid,
         max_timestamp: max_ts,
+        records,
         last_chain,
     }))
 }
@@ -257,6 +272,25 @@ pub fn verify_chain(path: &Path) -> Result<(ChainHash, ChainHash)> {
             }
         }
     }
+}
+
+/// True if `target` equals this segment's header seed or any record's stored
+/// chain value. Checkpoint verification uses this to locate a checkpointed
+/// chain head: the seed case covers a head that was the final record of a
+/// segment retention has since unlinked (the next segment's seed equals it).
+/// Chain values are taken as stored — callers pair this with [`verify_chain`],
+/// which proves the stored values are honest.
+pub fn chain_contains(path: &Path, target: &ChainHash) -> Result<bool> {
+    let mut r = SegmentReader::open(path)?;
+    if &r.seed == target {
+        return Ok(true);
+    }
+    while let Some((_, chain, _)) = r.next_record_raw()? {
+        if &chain == target {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Sequential reader over one segment's records.

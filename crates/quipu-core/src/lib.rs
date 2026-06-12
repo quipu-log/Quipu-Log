@@ -12,6 +12,7 @@
 //! The async event pipeline, filters, DLQ and HTTP proxy live in `quipu-middleware`;
 //! this crate is the synchronous storage and query core underneath it.
 
+pub mod checkpoint;
 pub mod crypto;
 pub mod error;
 pub mod id;
@@ -25,6 +26,7 @@ pub mod store;
 pub mod time;
 mod tokens;
 
+pub use checkpoint::Checkpoint;
 pub use crypto::KeyRing;
 pub use error::{Error, Result};
 pub use id::Uid;
@@ -36,4 +38,4 @@ pub use schema::{
     default_actor_type, default_target_type, CustomColumnDef, FieldDef, FieldIndex,
     FieldProtection, TypeSchema,
 };
-pub use store::{AuditStore, ReadSnapshot, StoreConfig, SyncPolicy};
+pub use store::{AnchorHook, AuditStore, ReadSnapshot, StoreConfig, SyncPolicy};

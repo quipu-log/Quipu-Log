@@ -6,14 +6,14 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
+use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Base64 (standard alphabet, padded) — implemented locally to avoid pulling a
 /// dependency for two small functions.
-mod b64 {
+pub(crate) mod b64 {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     pub fn encode(data: &[u8]) -> String {
@@ -197,6 +197,38 @@ impl KeyRing {
         }
     }
 
+    /// Whether this ring can produce signatures (i.e. holds the private key).
+    /// Write-only deployments (public key only) cannot sign — checkpointing
+    /// keys off this.
+    pub fn can_sign(&self) -> bool {
+        self.private.is_some()
+    }
+
+    /// RSA PKCS#1 v1.5 signature over SHA-256(data). PKCS#1 v1.5 (not PSS)
+    /// because it is deterministic: re-signing identical checkpoint bytes
+    /// yields identical signatures, which keeps externally anchored copies
+    /// byte-comparable.
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let key = self
+            .private
+            .as_ref()
+            .ok_or_else(|| Error::Crypto("no private key configured for signing".into()))?;
+        let digest = Sha256::digest(data);
+        key.sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+            .map_err(|e| Error::Crypto(e.to_string()))
+    }
+
+    /// Verify a signature produced by [`sign`](Self::sign). Needs only the
+    /// public key, so an auditor can verify without decryption capability.
+    pub fn verify_signature(&self, data: &[u8], signature: &[u8]) -> Result<()> {
+        let key = self.public.as_ref().ok_or_else(|| {
+            Error::Crypto("no public key configured for signature verification".into())
+        })?;
+        let digest = Sha256::digest(data);
+        key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, signature)
+            .map_err(|e| Error::Crypto(e.to_string()))
+    }
+
     /// Recover the canonical bytes of an RSA-protected value.
     pub fn decrypt(&self, stored: &StoredValue) -> Result<Vec<u8>> {
         let StoredValue::Rsa {
@@ -236,12 +268,22 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
-fn hex(digest: &[u8]) -> String {
+pub(crate) fn hex(digest: &[u8]) -> String {
     let mut s = String::with_capacity(digest.len() * 2);
     for b in digest {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+pub(crate) fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 #[cfg(test)]

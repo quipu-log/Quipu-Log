@@ -1,4 +1,6 @@
-use super::segment::{skim, verify_chain, ChainHash, Segment, SegmentReader, CHAIN_LEN};
+use super::segment::{
+    chain_contains, skim, verify_chain, ChainHash, Segment, SegmentReader, CHAIN_LEN,
+};
 use crate::error::Result;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -14,9 +16,10 @@ pub struct Table<T> {
     dir: PathBuf,
     active: Segment,
     active_seq: u64,
-    /// Sealed segments: seq -> (path, max record timestamp). Used by scans
-    /// (read in seq order) and retention (drop whole old segments).
-    sealed: BTreeMap<u64, (PathBuf, u64)>,
+    /// Sealed segments: seq -> (path, max record timestamp, record count).
+    /// Used by scans (read in seq order), retention (drop whole old segments)
+    /// and checkpointing (table-wide record count).
+    sealed: BTreeMap<u64, (PathBuf, u64, u64)>,
     max_segment_bytes: u64,
     _marker: PhantomData<T>,
 }
@@ -41,8 +44,10 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         let mut sealed = BTreeMap::new();
         for &seq in seqs.iter().filter(|&&s| s != active_seq) {
             let path = segment_path(dir, seq);
-            let max_ts = skim(&path)?.map(|s| s.max_timestamp).unwrap_or(0);
-            sealed.insert(seq, (path, max_ts));
+            let (max_ts, records) = skim(&path)?
+                .map(|s| (s.max_timestamp, s.records))
+                .unwrap_or((0, 0));
+            sealed.insert(seq, (path, max_ts, records));
         }
         // the seed only matters when the active file is brand new, i.e. the
         // table is empty — an existing active segment keeps its own header
@@ -73,7 +78,11 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         self.active.sync()?;
         self.sealed.insert(
             self.active_seq,
-            (self.active.path().to_path_buf(), self.active.max_timestamp),
+            (
+                self.active.path().to_path_buf(),
+                self.active.max_timestamp,
+                self.active.records(),
+            ),
         );
         self.active_seq += 1;
         // seed the new segment with the final chain value of the sealed one,
@@ -106,7 +115,7 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         let mut slices: Vec<SegmentSlice> = self
             .sealed
             .values()
-            .map(|(p, _)| SegmentSlice {
+            .map(|(p, _, _)| SegmentSlice {
                 path: p.clone(),
                 bound: u64::MAX,
             })
@@ -126,7 +135,7 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
     pub fn verify(&mut self) -> Result<()> {
         self.active.flush()?;
         let mut prev: Option<ChainHash> = None;
-        let mut paths: Vec<PathBuf> = self.sealed.values().map(|(p, _)| p.clone()).collect();
+        let mut paths: Vec<PathBuf> = self.sealed.values().map(|(p, _, _)| p.clone()).collect();
         paths.push(self.active.path().to_path_buf());
         for path in paths {
             let (seed, last) = verify_chain(&path)?;
@@ -153,15 +162,45 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         let doomed: Vec<u64> = self
             .sealed
             .iter()
-            .filter(|(_, (_, max_ts))| *max_ts < cutoff_micros)
+            .filter(|(_, (_, max_ts, _))| *max_ts < cutoff_micros)
             .map(|(&seq, _)| seq)
             .collect();
         for seq in &doomed {
-            if let Some((path, _)) = self.sealed.remove(seq) {
+            if let Some((path, _, _)) = self.sealed.remove(seq) {
                 std::fs::remove_file(path)?;
             }
         }
         Ok(doomed.len())
+    }
+
+    /// Sequence number of the segment currently being written.
+    pub fn active_seq(&self) -> u64 {
+        self.active_seq
+    }
+
+    /// Chain value of the newest record across the whole table (the seed of
+    /// the active segment when it is still empty — same value either way).
+    pub fn chain_head(&self) -> ChainHash {
+        self.active.last_chain()
+    }
+
+    /// Records currently on disk across all segments. Decreases when
+    /// retention unlinks sealed segments.
+    pub fn record_count(&self) -> u64 {
+        self.active.records() + self.sealed.values().map(|(_, _, n)| n).sum::<u64>()
+    }
+
+    /// Whether `target` is the stored chain value of any record (or a segment
+    /// seed) in this table — see [`chain_contains`]. Drives checkpoint-head
+    /// verification.
+    pub fn contains_chain_value(&mut self, target: &ChainHash) -> Result<bool> {
+        self.active.flush()?;
+        for (path, _, _) in self.sealed.values() {
+            if chain_contains(path, target)? {
+                return Ok(true);
+            }
+        }
+        chain_contains(self.active.path(), target)
     }
 }
 
@@ -175,7 +214,7 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         // file is unlinked (required for OS-independence, e.g. Windows)
         self.active = Segment::open(&segment_path(&self.dir, self.active_seq), [0; CHAIN_LEN])?;
         std::fs::remove_file(old_active)?;
-        for (_, (path, _)) in std::mem::take(&mut self.sealed) {
+        for (_, (path, _, _)) in std::mem::take(&mut self.sealed) {
             std::fs::remove_file(path)?;
         }
         Ok(())
