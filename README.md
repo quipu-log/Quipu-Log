@@ -6,7 +6,7 @@ That's a pretty good picture of what this library does for your API.
 
 Quipu-Log is an embedded audit log for Rust services. It records *who did what to
 which entities through which API*, and lets you query it back later, including
-by attribute values the entities had **at the time**. If a patient was renamed
+by attribute values the entities had **at the time**. If a user was renamed
 last month, logs written before the rename still render the old name, and you
 can still search by it.
 
