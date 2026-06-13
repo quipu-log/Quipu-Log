@@ -57,6 +57,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # cargo-fuzz instruments std with a sanitizer, which needs to rebuild
+          # core/std from source — without rust-src that fails with
+          # "can't find crate for `core`".
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
