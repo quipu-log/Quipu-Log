@@ -184,7 +184,9 @@ impl RegistryIndex {
                         versions
                             .into_iter()
                             .map(|v| {
-                                Ok(keys.hmac_hex_with(v, &probe.canonical_bytes())?.into_bytes())
+                                Ok(keys
+                                    .hmac_hex_with(v, &probe.canonical_bytes())?
+                                    .into_bytes())
                             })
                             .collect::<Result<_>>()?
                     }
@@ -305,7 +307,12 @@ impl RegistryIndex {
             FieldProtection::None | FieldProtection::Sha256 => vec![probe_tokens
                 .iter()
                 .map(|t| {
-                    keys.index_token_digest_with(crate::crypto::KEYLESS, &def.name, def.protection, t)
+                    keys.index_token_digest_with(
+                        crate::crypto::KEYLESS,
+                        &def.name,
+                        def.protection,
+                        t,
+                    )
                 })
                 .collect::<Result<_>>()?],
             FieldProtection::Hmac | FieldProtection::Rsa => {

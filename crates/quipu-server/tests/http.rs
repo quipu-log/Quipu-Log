@@ -247,7 +247,6 @@ async fn full_append_query_flow() {
     pipeline.shutdown();
 }
 
-
 /// records with the token's role as actor; reading them needs `administer`;
 /// reading them grows the log by exactly one record per read; search probe
 /// values never appear in the records.
@@ -281,7 +280,14 @@ async fn access_log_records_queries_and_admin_ops() {
     let q = json!({ "targets": [{
         "entity_type": "user", "field": "name", "value": { "Text": "SECRET-PROBE" }
     }]});
-    let (status, _) = send(&app, "POST", "/v1/logs/query", Some("reader-token"), Some(q)).await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(q),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     // ... and an admin runs a redrive
     let (status, _) = send(&app, "POST", "/v1/admin/redrive", Some("admin-token"), None).await;
@@ -456,7 +462,14 @@ async fn idempotency_key_dedupes_retransmissions() {
 async fn export_returns_ndjson_one_line_per_record() {
     let dir = tempfile::tempdir().unwrap();
     let (app, pipeline) = test_app(dir.path());
-    send(&app, "POST", "/v1/types", Some("admin-token"), Some(user_schema())).await;
+    send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
     for url in ["/api/a", "/api/b"] {
         let (status, _) = send(
             &app,
@@ -514,7 +527,6 @@ async fn openapi_is_served_unauthenticated_and_valid() {
     assert!(body["paths"]["/v1/logs"]["post"].is_object());
     pipeline.shutdown();
 }
-
 
 #[tokio::test]
 async fn auth_and_permission_errors() {
@@ -893,14 +905,18 @@ async fn query_pagination_and_count() {
     let mut urls = Vec::new();
     let mut q = json!({ "limit": 4 });
     loop {
-        let (status, body) = send(&app, "POST", "/v1/logs/query", Some("reader-token"), Some(q)).await;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/logs/query",
+            Some("reader-token"),
+            Some(q),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let page = body["logs"].as_array().unwrap();
         assert!(page.len() <= 4);
-        urls.extend(
-            page.iter()
-                .map(|v| v["url"].as_str().unwrap().to_string()),
-        );
+        urls.extend(page.iter().map(|v| v["url"].as_str().unwrap().to_string()));
         match body.get("next_cursor") {
             Some(c) => q = json!({ "limit": 4, "cursor": c }),
             None => break,

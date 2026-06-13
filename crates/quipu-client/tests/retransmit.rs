@@ -2,9 +2,7 @@
 //! spool-on-exhaustion, and spool replay — all against a scripted transport so
 //! no network or real time is involved.
 
-use quipu_client::{
-    Client, Delivery, Event, SendOutcome, Sleeper, Spool, SpoolRecord, Transport,
-};
+use quipu_client::{Client, Delivery, Event, SendOutcome, Sleeper, Spool, SpoolRecord, Transport};
 use quipu_core::{Content, EntityInput};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -159,7 +157,11 @@ fn spools_when_retries_exhausted_then_drains() {
     {
         let t = ScriptedTransport::new(vec![SendOutcome::Accepted], SendOutcome::Accepted);
         let spool = Spool::open(&path).unwrap();
-        assert_eq!(spool.len().unwrap(), 1, "spooled event survived the restart");
+        assert_eq!(
+            spool.len().unwrap(),
+            1,
+            "spooled event survived the restart"
+        );
         let mut client = Client::new(t).sleeper(Box::new(NoSleep)).with_spool(spool);
         let report = client.drain_spool().unwrap();
         assert_eq!(report.delivered, 1);
@@ -186,7 +188,12 @@ fn drain_keeps_records_while_still_failing() {
     assert_eq!(report.delivered, 0);
     assert_eq!(report.kept, 3);
     assert_eq!(spool.len().unwrap(), 3);
-    let keys: Vec<String> = spool.read_all().unwrap().into_iter().map(|r| r.idempotency_key).collect();
+    let keys: Vec<String> = spool
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.idempotency_key)
+        .collect();
     assert_eq!(keys, ["key-0", "key-1", "key-2"]);
 }
 
@@ -206,7 +213,10 @@ fn torn_tail_is_truncated_on_open() {
     // append a half-written frame: a length header promising bytes that aren't there
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(&999u32.to_le_bytes()).unwrap();
         f.write_all(&0u32.to_le_bytes()).unwrap();
         f.write_all(b"partial").unwrap();

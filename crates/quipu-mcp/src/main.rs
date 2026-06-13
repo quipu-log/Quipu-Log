@@ -59,8 +59,16 @@ fn issue_token(role: Option<String>, expires: Option<String>) -> ! {
     let issued = quipu_mcp::issuer::issue(&role, expires);
     let mut out = std::io::stdout().lock();
     // the token goes to the client once; the config line goes to the server
-    let _ = writeln!(out, "token (give to the client, store nowhere else):\n  {}", issued.token);
-    let _ = writeln!(out, "\nadd under auth.tokens in the server config:\n  {}", issued.config_entry());
+    let _ = writeln!(
+        out,
+        "token (give to the client, store nowhere else):\n  {}",
+        issued.token
+    );
+    let _ = writeln!(
+        out,
+        "\nadd under auth.tokens in the server config:\n  {}",
+        issued.config_entry()
+    );
     let _ = writeln!(
         out,
         "\nthen grant the role its scope under auth.grants, e.g.\n  \"{}\": [\"query\"]   (add \"administer\" to allow verify_store_integrity)",

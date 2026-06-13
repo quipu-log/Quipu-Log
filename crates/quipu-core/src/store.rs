@@ -8,9 +8,7 @@ use crate::query::{LogQuery, LogView, Order, QueryPage, TargetFilter, TargetSnap
 use crate::registry::{EntityInput, FieldTokens, RegistryIndex, RegistryRecord, TypeRegistry};
 use crate::retention::RetentionPolicy;
 use crate::schema::{CustomColumnDef, FieldIndex, TypeSchema};
-use crate::storage::{
-    rewrite_table, ChainHash, Position, PositionedScan, SegmentSlice, Table,
-};
+use crate::storage::{rewrite_table, ChainHash, Position, PositionedScan, SegmentSlice, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -248,7 +246,10 @@ impl AuditStore {
         let logs = Table::open(&cfg.root.join("logs"), cfg.max_segment_bytes)?;
         let relations = Table::open(&cfg.root.join("relations"), cfg.max_segment_bytes)?;
         let access = if cfg.access_log {
-            Some(Table::open(&cfg.root.join("access"), cfg.max_segment_bytes)?)
+            Some(Table::open(
+                &cfg.root.join("access"),
+                cfg.max_segment_bytes,
+            )?)
         } else {
             None
         };
@@ -683,10 +684,7 @@ impl AuditStore {
         for name in names {
             // drop the open registry (its table holds open file handles)
             // before rewriting its directory, then reopen on the new chain
-            let reg = self
-                .registries
-                .remove(&name)
-                .expect("name was just listed");
+            let reg = self.registries.remove(&name).expect("name was just listed");
             let schema = reg.schema().clone();
             drop(reg);
             let dir = self.cfg.root.join("registry").join(&name);

@@ -47,11 +47,7 @@ impl SyslogSink {
     /// RFC 5424 APP-NAME tag. `queue_capacity` bounds the in-flight backlog —
     /// past it, lines are dropped (and counted) rather than blocking the audit
     /// writer.
-    pub fn new(
-        collector: &str,
-        app_name: &str,
-        queue_capacity: usize,
-    ) -> std::io::Result<Self> {
+    pub fn new(collector: &str, app_name: &str, queue_capacity: usize) -> std::io::Result<Self> {
         // bind to an ephemeral local port; connect so every send_to targets
         // the collector and the kernel can report unreachable early
         let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -105,7 +101,13 @@ impl SyslogSink {
 /// Build one RFC 5424 line:
 /// `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID - MSG`, where MSG is a
 /// compact JSON summary of the event. STRUCTURED-DATA is `-` (none).
-fn format_5424(pri: u8, hostname: &str, app_name: &str, event: &AuditEvent, log_id: quipu_core::Uid) -> String {
+fn format_5424(
+    pri: u8,
+    hostname: &str,
+    app_name: &str,
+    event: &AuditEvent,
+    log_id: quipu_core::Uid,
+) -> String {
     let ts = rfc3339_micros(event.occurred_at);
     let procid = std::process::id();
     let summary = serde_json::json!({
@@ -132,7 +134,11 @@ fn rfc3339_micros(unix_micros: u64) -> String {
     let micros = unix_micros % 1_000_000;
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
-    let (h, m, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (h, m, s) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{micros:06}Z")
 }
@@ -185,7 +191,10 @@ mod tests {
     #[test]
     fn rfc3339_is_correct() {
         // 2026-06-13T00:00:00Z = 1_780_704_000 s (verified against date -u)
-        assert_eq!(rfc3339_micros(1_781_308_800_000_000), "2026-06-13T00:00:00.000000Z");
+        assert_eq!(
+            rfc3339_micros(1_781_308_800_000_000),
+            "2026-06-13T00:00:00.000000Z"
+        );
         assert_eq!(rfc3339_micros(0), "1970-01-01T00:00:00.000000Z");
         assert_eq!(
             rfc3339_micros(1_781_308_800_000_000 + 123_456),

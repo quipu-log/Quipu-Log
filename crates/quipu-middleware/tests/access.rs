@@ -54,7 +54,10 @@ fn query_leaves_access_record_with_actor_operation_and_count() {
         handle.emit(&auditor, event(&format!("/api/{i}"))).unwrap();
     }
     handle.flush().unwrap();
-    assert_eq!(handle.query(&auditor, LogQuery::default()).unwrap().len(), 7);
+    assert_eq!(
+        handle.query(&auditor, LogQuery::default()).unwrap().len(),
+        7
+    );
 
     let recs = handle
         .query_access(
@@ -188,7 +191,9 @@ fn access_log_respects_permissions_and_disabled_store() {
     )
     .unwrap();
     let handle = pipeline.handle();
-    handle.query(&Role::new("any"), LogQuery::default()).unwrap();
+    handle
+        .query(&Role::new("any"), LogQuery::default())
+        .unwrap();
     assert!(matches!(
         handle.query_access(&Role::new("any"), AccessQuery::default()),
         Err(MiddlewareError::Core(quipu_core::Error::Schema(_)))

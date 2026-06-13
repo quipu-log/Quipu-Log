@@ -29,17 +29,30 @@ fn canned_server(response: &'static [u8]) -> (String, thread::JoinHandle<String>
 
 #[test]
 fn query_logs_sends_bearer_and_parses_array() {
-    let (addr, server) = canned_server(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\n[{\"url\":\"/api/x\"}]\n\n\n",
-    );
+    let (addr, server) =
+        canned_server(b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\n[{\"url\":\"/api/x\"}]\n\n\n");
     let backend = HttpBackend::new(addr, "agent-token");
-    let out = backend.query_logs(&serde_json::json!({ "method": "POST" })).unwrap();
+    let out = backend
+        .query_logs(&serde_json::json!({ "method": "POST" }))
+        .unwrap();
 
     let request = server.join().unwrap();
-    assert!(request.starts_with("POST /v1/logs/query HTTP/1.1"), "{request}");
-    assert!(request.contains("Authorization: Bearer agent-token"), "{request}");
-    assert!(request.contains("Content-Type: application/json"), "{request}");
-    assert!(request.contains("\"method\":\"POST\""), "body forwarded: {request}");
+    assert!(
+        request.starts_with("POST /v1/logs/query HTTP/1.1"),
+        "{request}"
+    );
+    assert!(
+        request.contains("Authorization: Bearer agent-token"),
+        "{request}"
+    );
+    assert!(
+        request.contains("Content-Type: application/json"),
+        "{request}"
+    );
+    assert!(
+        request.contains("\"method\":\"POST\""),
+        "body forwarded: {request}"
+    );
     assert_eq!(out[0]["url"], "/api/x");
 }
 
@@ -58,8 +71,9 @@ fn entity_history_is_a_get_with_encoded_path() {
 
 #[test]
 fn http_400_is_a_fatal_error_with_server_message() {
-    let (addr, server) =
-        canned_server(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\n{\"error\":\"bad query body\"}");
+    let (addr, server) = canned_server(
+        b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\n{\"error\":\"bad query body\"}",
+    );
     let backend = HttpBackend::new(addr, "t");
     let err = backend.query_logs(&serde_json::json!({})).unwrap_err();
     server.join().unwrap();
@@ -69,8 +83,9 @@ fn http_400_is_a_fatal_error_with_server_message() {
 
 #[test]
 fn http_503_is_retryable() {
-    let (addr, server) =
-        canned_server(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 22\r\n\r\n{\"error\":\"queue full\"}");
+    let (addr, server) = canned_server(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 22\r\n\r\n{\"error\":\"queue full\"}",
+    );
     let backend = HttpBackend::new(addr, "t");
     let err = backend.verify_integrity().unwrap_err();
     server.join().unwrap();

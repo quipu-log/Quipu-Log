@@ -34,7 +34,8 @@ fn fill(store: &mut AuditStore, start: u64, n: u64) {
                 Content::Text(format!("event-{i}")),
                 &[(
                     "default_target".into(),
-                    EntityInput::new(format!("thing-{}", i % 7)).text("name", format!("t{}", i % 7)),
+                    EntityInput::new(format!("thing-{}", i % 7))
+                        .text("name", format!("t{}", i % 7)),
                 )],
                 BTreeMap::new(),
             )
@@ -225,7 +226,10 @@ fn bad_cursors_are_client_errors() {
         cursor: Some("not-a-cursor!!".into()),
         ..Default::default()
     });
-    assert!(matches!(garbage, Err(Error::InvalidCursor(_))), "{garbage:?}");
+    assert!(
+        matches!(garbage, Err(Error::InvalidCursor(_))),
+        "{garbage:?}"
+    );
 
     // a cursor issued under desc cannot continue an asc query
     let page = store
@@ -239,7 +243,10 @@ fn bad_cursors_are_client_errors() {
         cursor: page.next_cursor,
         ..Default::default()
     });
-    assert!(matches!(flipped, Err(Error::InvalidCursor(_))), "{flipped:?}");
+    assert!(
+        matches!(flipped, Err(Error::InvalidCursor(_))),
+        "{flipped:?}"
+    );
 }
 
 #[test]

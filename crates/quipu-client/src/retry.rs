@@ -18,7 +18,12 @@ pub fn new_idempotency_key() -> String {
     // RFC 4122 version 4, variant 1
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let h = |b: u8| (b"0123456789abcdef"[(b >> 4) as usize], b"0123456789abcdef"[(b & 0xf) as usize]);
+    let h = |b: u8| {
+        (
+            b"0123456789abcdef"[(b >> 4) as usize],
+            b"0123456789abcdef"[(b & 0xf) as usize],
+        )
+    };
     let mut s = String::with_capacity(36);
     for (i, &b) in bytes.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {
@@ -88,7 +93,10 @@ mod tests {
         let k = new_idempotency_key();
         assert_eq!(k.len(), 36);
         let parts: Vec<&str> = k.split('-').collect();
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
         assert!(k.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         // version nibble
         assert_eq!(parts[2].as_bytes()[0], b'4');
@@ -110,7 +118,10 @@ mod tests {
         for attempt in 1..=3 {
             let d = b.delay(attempt).unwrap();
             let cap = (0.1 * 2f64.powi((attempt - 1) as i32)).min(10.0);
-            assert!(d.as_secs_f64() <= cap + 1e-9, "attempt {attempt}: {d:?} > {cap}");
+            assert!(
+                d.as_secs_f64() <= cap + 1e-9,
+                "attempt {attempt}: {d:?} > {cap}"
+            );
         }
         // exhausted past max_retries
         assert!(b.delay(4).is_none());

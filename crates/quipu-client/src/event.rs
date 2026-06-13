@@ -105,12 +105,26 @@ mod tests {
         .target(Target::new("account", EntityInput::new("acct-9")))
         .custom("amount", Value::Number(100.0));
         let json = serde_json::to_value(&event).unwrap();
-        let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         // exactly the fields of quipu_server::api::AppendRequest
         assert_eq!(
             keys,
-            ["actor", "actor_type", "content", "custom", "method", "occurred_at", "targets", "url"]
+            [
+                "actor",
+                "actor_type",
+                "content",
+                "custom",
+                "method",
+                "occurred_at",
+                "targets",
+                "url"
+            ]
         );
     }
 

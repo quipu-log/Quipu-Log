@@ -26,7 +26,9 @@ fn server() -> Server<StubBackend> {
 }
 
 fn reply(s: &Server<StubBackend>, msg: Value) -> Value {
-    let line = s.handle_line(&msg.to_string()).expect("expected a response");
+    let line = s
+        .handle_line(&msg.to_string())
+        .expect("expected a response");
     serde_json::from_str(&line).unwrap()
 }
 
@@ -46,20 +48,28 @@ fn initialize_advertises_tools_capability() {
 #[test]
 fn initialized_notification_gets_no_reply() {
     assert!(server()
-        .handle_line(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string())
+        .handle_line(
+            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string()
+        )
         .is_none());
 }
 
 #[test]
 fn tools_list_returns_the_three_tools() {
-    let r = reply(&server(), json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
+    let r = reply(
+        &server(),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    );
     let names: Vec<&str> = r["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["query_logs", "get_entity_history", "verify_store_integrity"]);
+    assert_eq!(
+        names,
+        ["query_logs", "get_entity_history", "verify_store_integrity"]
+    );
     // each tool carries an inputSchema object
     for tool in r["result"]["tools"].as_array().unwrap() {
         assert!(tool["inputSchema"]["type"] == "object");
@@ -88,12 +98,18 @@ fn tools_call_backend_error_is_tool_error_not_protocol_error() {
     // protocol-level success, tool-level error
     assert!(r.get("error").is_none());
     assert_eq!(r["result"]["isError"], json!(true));
-    assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("private key"));
+    assert!(r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("private key"));
 }
 
 #[test]
 fn unknown_method_is_jsonrpc_method_not_found() {
-    let r = reply(&server(), json!({ "jsonrpc": "2.0", "id": 5, "method": "do/everything" }));
+    let r = reply(
+        &server(),
+        json!({ "jsonrpc": "2.0", "id": 5, "method": "do/everything" }),
+    );
     assert_eq!(r["error"]["code"], -32601);
 }
 

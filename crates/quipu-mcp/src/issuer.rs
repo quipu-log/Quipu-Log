@@ -82,10 +82,16 @@ mod tests {
     fn issued_token_hash_matches_server_hashing() {
         let issued = issue("audit-reader", None);
         // the hashed key is exactly sha256: + sha256_hex(token)
-        assert_eq!(issued.hashed_key, format!("sha256:{}", sha256_hex(&issued.token)));
+        assert_eq!(
+            issued.hashed_key,
+            format!("sha256:{}", sha256_hex(&issued.token))
+        );
         assert_eq!(issued.token.len(), 64); // 32 bytes hex
         assert!(issued.config_entry().contains("audit-reader"));
-        assert!(!issued.config_entry().contains(&issued.token), "config stores the hash, not the token");
+        assert!(
+            !issued.config_entry().contains(&issued.token),
+            "config stores the hash, not the token"
+        );
     }
 
     #[test]

@@ -105,9 +105,7 @@ fn exact(field: &str, probe: &str) -> LogQuery {
 
 fn contains(field: &str, probe: &str) -> LogQuery {
     LogQuery {
-        targets: vec![
-            TargetFilter::exact("patient", field, Value::Text(probe.into())).contains(),
-        ],
+        targets: vec![TargetFilter::exact("patient", field, Value::Text(probe.into())).contains()],
         ..Default::default()
     }
 }
@@ -226,7 +224,11 @@ fn rekey_rewraps_rsa_values_and_reindexes_their_tokens() {
     let mut store = open_store(dir.path(), ring_v2_rsa_only());
     store.verify_integrity().unwrap();
     let hits = store.query(&exact("ssn", "123-45-6789")).unwrap();
-    assert_eq!(hits.len(), 1, "old HMAC digests match via the retained v1 HMAC key");
+    assert_eq!(
+        hits.len(),
+        1,
+        "old HMAC digests match via the retained v1 HMAC key"
+    );
     let name = hits[0].targets[0].fields.get("name").unwrap();
     assert_eq!(store.decrypt(name).unwrap(), b"Kim Daehyeon");
     // the RSA field's tokens were re-digested under HMAC v2 at re-key time

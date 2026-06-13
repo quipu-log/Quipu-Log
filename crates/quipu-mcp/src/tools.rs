@@ -114,10 +114,16 @@ mod tests {
     }
     impl MockBackend {
         fn ok(reply: Value) -> Self {
-            Self { last_query: Mutex::new(None), reply: Ok(reply) }
+            Self {
+                last_query: Mutex::new(None),
+                reply: Ok(reply),
+            }
         }
         fn err(e: BackendError) -> Self {
-            Self { last_query: Mutex::new(None), reply: Err(e) }
+            Self {
+                last_query: Mutex::new(None),
+                reply: Err(e),
+            }
         }
     }
     impl Backend for MockBackend {
@@ -136,9 +142,16 @@ mod tests {
     #[test]
     fn query_logs_forwards_query_and_wraps_result() {
         let backend = MockBackend::ok(json!([{ "url": "/x" }]));
-        let out = call(&backend, QUERY_LOGS, &json!({ "query": { "method": "POST" } }));
+        let out = call(
+            &backend,
+            QUERY_LOGS,
+            &json!({ "query": { "method": "POST" } }),
+        );
         assert!(out.get("isError").is_none());
-        assert_eq!(*backend.last_query.lock().unwrap(), Some(json!({ "method": "POST" })));
+        assert_eq!(
+            *backend.last_query.lock().unwrap(),
+            Some(json!({ "method": "POST" }))
+        );
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("/x"));
     }
@@ -146,7 +159,11 @@ mod tests {
     #[test]
     fn missing_args_is_tool_error_not_panic() {
         let backend = MockBackend::ok(json!([]));
-        let out = call(&backend, GET_ENTITY_HISTORY, &json!({ "entity_type": "user" }));
+        let out = call(
+            &backend,
+            GET_ENTITY_HISTORY,
+            &json!({ "entity_type": "user" }),
+        );
         assert_eq!(out["isError"], json!(true));
     }
 
@@ -155,7 +172,10 @@ mod tests {
         let backend = MockBackend::ok(json!([]));
         let out = call(&backend, "drop_table", &json!({}));
         assert_eq!(out["isError"], json!(true));
-        assert!(out["content"][0]["text"].as_str().unwrap().contains("unknown tool"));
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
     }
 
     #[test]
@@ -163,6 +183,9 @@ mod tests {
         let backend = MockBackend::err(BackendError::retryable("queue full"));
         let out = call(&backend, VERIFY_STORE_INTEGRITY, &json!({}));
         assert_eq!(out["isError"], json!(true));
-        assert!(out["content"][0]["text"].as_str().unwrap().contains("transient"));
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("transient"));
     }
 }

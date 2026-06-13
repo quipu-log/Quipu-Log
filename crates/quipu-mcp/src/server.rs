@@ -44,7 +44,13 @@ impl<B: Backend> Server<B> {
         }
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => return Some(error_response(Value::Null, codes::PARSE_ERROR, "parse error")),
+            Err(_) => {
+                return Some(error_response(
+                    Value::Null,
+                    codes::PARSE_ERROR,
+                    "parse error",
+                ))
+            }
         };
         let id = msg.get("id").cloned();
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
@@ -75,10 +81,10 @@ impl<B: Backend> Server<B> {
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools::tool_defs() })),
             "tools/call" => {
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .ok_or((codes::INVALID_PARAMS, "tools/call requires 'name'".to_string()))?;
+                let name = params.get("name").and_then(Value::as_str).ok_or((
+                    codes::INVALID_PARAMS,
+                    "tools/call requires 'name'".to_string(),
+                ))?;
                 let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
                 Ok(tools::call(&self.backend, name, &arguments))
             }
@@ -89,11 +95,7 @@ impl<B: Backend> Server<B> {
     /// Run the stdio loop until stdin closes. One request per line in, one
     /// response per line out, flushed each time so the client sees replies
     /// promptly.
-    pub fn run_stdio(
-        &self,
-        input: impl BufRead,
-        mut output: impl Write,
-    ) -> std::io::Result<()> {
+    pub fn run_stdio(&self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
         for line in input.lines() {
             let line = line?;
             if let Some(response) = self.handle_line(&line) {

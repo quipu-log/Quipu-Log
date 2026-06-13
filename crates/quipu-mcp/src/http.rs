@@ -126,9 +126,7 @@ fn parse_response(raw: &[u8]) -> Option<(u16, &[u8])> {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Percent-encode one path segment (entity type/id can contain arbitrary
@@ -180,7 +178,11 @@ mod tests {
     #[test]
     fn classify_splits_retryable_from_fatal() {
         assert!(classify(200, b"[]").is_ok());
-        assert!(classify(503, br#"{"error":"queue full"}"#).unwrap_err().retryable);
+        assert!(
+            classify(503, br#"{"error":"queue full"}"#)
+                .unwrap_err()
+                .retryable
+        );
         assert!(classify(409, b"{}").unwrap_err().retryable);
         let fatal = classify(400, br#"{"error":"bad query"}"#).unwrap_err();
         assert!(!fatal.retryable);

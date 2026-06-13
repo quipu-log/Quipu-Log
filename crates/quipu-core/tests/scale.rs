@@ -102,9 +102,14 @@ fn narrow_window_query_skips_cold_segments() {
     assert_eq!(latest_page.logs.len(), 100);
 
     println!("rows:                {n}");
-    println!("write:               {write_s:.2}s ({:.0} rows/s)", n as f64 / write_s);
+    println!(
+        "write:               {write_s:.2}s ({:.0} rows/s)",
+        n as f64 / write_s
+    );
     println!("log segments:        {total_segments}");
-    println!("full count:          {full_scan_s:.3}s  (= pre-pruning cost of ANY time-range query)");
+    println!(
+        "full count:          {full_scan_s:.3}s  (= pre-pruning cost of ANY time-range query)"
+    );
     println!(
         "narrow count (0.1%): {narrow_s:.3}s  ({:.0}x faster)",
         full_scan_s / narrow_s

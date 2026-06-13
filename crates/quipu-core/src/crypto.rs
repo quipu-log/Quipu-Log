@@ -235,7 +235,9 @@ impl KeyRing {
             .get(&version)
             .and_then(|p| p.public.as_ref())
             .ok_or_else(|| {
-                Error::Crypto(format!("RSA public key version {version} is not in the key ring"))
+                Error::Crypto(format!(
+                    "RSA public key version {version} is not in the key ring"
+                ))
             })
     }
 
@@ -334,7 +336,10 @@ impl KeyRing {
             }
             FieldProtection::Hmac => {
                 let (key_version, digest) = self.hmac_hex(&value.canonical_bytes())?;
-                Ok(StoredValue::Hmac { key_version, digest })
+                Ok(StoredValue::Hmac {
+                    key_version,
+                    digest,
+                })
             }
             FieldProtection::Rsa => {
                 let key_version = self.active_rsa_version().ok_or_else(|| {
