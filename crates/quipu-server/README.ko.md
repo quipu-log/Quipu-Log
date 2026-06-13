@@ -36,6 +36,7 @@ cargo run -p quipu-server -- config.json
     "root": "/var/lib/quipu",
     "sync_policy": { "every_n": 64 },
     "retention_days": 365,
+    "retention_max_bytes": 53687091200,
     "plaintext_cache": false
   },
   "keys": {
@@ -58,13 +59,23 @@ cargo run -p quipu-server -- config.json
     },
     "max_concurrent_queries": 2
   },
-  "verify": { "interval_secs": 86400 }
+  "verify": { "interval_secs": 86400 },
+  "health": {
+    "min_free_bytes": 1073741824,
+    "min_free_ratio": 0.10,
+    "reject_emit_when_disk_full": false
+  }
 }
 ```
 
 - `sync_policy`는 `"always"`, `"os_managed"`, `{ "every_n": N }` 중 하나입니다.
+- `retention_days`와 `retention_max_bytes`(둘 다 선택)는 각각 보존 기간과
+  로그·관계 테이블의 용량 한도입니다. 두 조건은 **OR**로 묶입니다 —
+  어느 쪽이든 한도를 넘는 순간 가장 오래된 봉인 세그먼트부터 지웁니다.
 - `verify`(선택)는 주기적인 [무결성 검증](#무결성-검증)입니다.
   시작할 때 한 번, 이후 `interval_secs`마다 한 번씩 돕니다. 빼면 꺼집니다.
+- `health`(선택)는 디스크 여유 공간 경고 기준(둘 중 하나만 걸려도 경고,
+  위 값이 기본값)과 [디스크가 가득 찼을 때의 동작](#디스크가-가득-차면)입니다.
 - 키 자료는 항상 파일 경로로 참조합니다. 설정 파일에 직접 넣을 수 없습니다.
 - 인증은 기본 거부라서 권한을 받지 못한 역할은 아무것도 할 수 없습니다.
   토큰은 호출 서비스마다 하나씩 발급해서
@@ -199,11 +210,14 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 401은 토큰 누락·미등록·만료, 403은 역할에 권한 없음, 400은 스키마나 암호화 오용,
 404는 없음, 409는 무결성 검증이 이미 돌고 있다는 뜻(끝난 뒤 다시 시도하세요),
 429는 그 토큰의 동시 쿼리 상한 도달(돌던 쿼리가 끝나면 재시도하세요),
-503은 큐가 가득 찼다는 뜻(백오프 후 재시도하세요), 그 외는 500입니다.
+503은 큐가 가득 찼다는 뜻(백오프 후 재시도하세요),
+507은 디스크가 가득 찬 상태에서 `reject_emit_when_disk_full`이 켜져 있다는 뜻
+(더 길게 백오프하세요), 그 외는 500입니다.
 
 | 메서드 & 경로 | 권한 | 본문 / 응답 |
 |---|---|---|
-| `GET /v1/healthz` | — | `ok` |
+| `GET /v1/healthz` | — | `{"status": "ok"/"degraded"/"unhealthy", "reasons": [...]}` — [헬스 체크](#헬스-체크) 참고 |
+| `GET /metrics` | administer | Prometheus 텍스트 포맷 — [메트릭](#메트릭) 참고 |
 | `POST /v1/types` | administer | `TypeSchema` JSON → 204. 재정의는 추가만 가능. |
 | `GET /v1/types` | query | `[TypeSchema]` |
 | `POST /v1/columns` | administer | `CustomColumnDef` JSON → 204 |
@@ -341,6 +355,93 @@ cron을 걸기 전에 알아둘 것 두 가지:
   보통 크기의 스토어라면 문제없지만, 아주 큰 스토어에 쓰기가 몰리는
   환경이라면 한가한 시간대에 돌리거나
   검증 중 `POST /v1/logs`가 일부 503을 받을 수 있다고 보면 됩니다.
+
+## 헬스 체크
+
+`GET /v1/healthz`(토큰 불필요)는
+`{"status": "ok"|"degraded"|"unhealthy", "reasons": [...]}`로 답합니다.
+
+- **`unhealthy`** (HTTP **503**) — 이벤트가 디스크에 적히지 *못하고* 있다는
+  뜻입니다. writer 스레드가 죽었거나, 디스크 풀 래치가 걸려 있거나,
+  방금 스토어 루트에 시험 쓰기를 했는데 실패한 경우입니다.
+- **`degraded`** (HTTP **200**) — 쓰기는 되지만 디스크 여유 공간이
+  `health` 기준 아래로 내려간 상태입니다. 일부러 200으로 둡니다.
+  아직 멀쩡히 기록 중인 인스턴스를 로드밸런서가 빼버리면 안 되니까요.
+  경고는 본문에 실려 있으니 모니터링이 거기에 알람을 걸면 됩니다.
+- **`ok`** (HTTP **200**).
+
+검사는 요청마다 실시간으로 돕니다. 파이프라인이 들고 있는 writer 생존
+여부·디스크 풀 래치에 더해, 스토어 루트에 실제로 파일을 만들어 쓰고
+fsync하고 지우는 시험 쓰기와 여유 공간 측정을 그 자리에서 수행합니다.
+
+> 호환성 주의: v0.2 전에는 이 엔드포인트가 무조건 평문 `ok`를 돌려줬습니다.
+> 본문 문자열을 비교하던 모니터링은 상태 코드나 JSON의 `status` 필드를
+> 보도록 바꿔야 합니다.
+
+## 메트릭
+
+`GET /metrics`는 Prometheus 텍스트 포맷(v0.0.4)을 냅니다.
+다른 운영용 엔드포인트와 마찬가지로 `administer` 권한 토큰 뒤에 있으니,
+Prometheus에게 전용 토큰을 하나 발급해 주세요.
+
+```yaml
+scrape_configs:
+  - job_name: quipu
+    authorization: { credentials: <token> }
+    static_configs: [{ targets: ["quipu-host:7700"] }]
+```
+
+| 메트릭 | 타입 | 의미 |
+|---|---|---|
+| `quipu_queue_depth` | gauge | 큐에 들어갔지만 아직 writer가 집어가지 않은 이벤트 수 |
+| `quipu_dlq_entries` | gauge | DLQ에 보관 중인 이벤트 수 |
+| `quipu_writes_ok_total` | counter | 디스크에 안전하게 적힌 이벤트 수 |
+| `quipu_write_retries_total` | counter | 실패 후 재시도된 쓰기 횟수 |
+| `quipu_writes_parked_total` | counter | 재시도를 소진하고(또는 디스크 풀로) DLQ에 들어간 이벤트 수 |
+| `quipu_events_lost_total` | counter | 스토어와 DLQ가 *둘 다* 실패한 이벤트 수. 폴백 훅만 남음 |
+| `quipu_emit_rejected_total{reason}` | counter | 호출 시점에 거부된 emit: `queue_full` / `disk_full` |
+| `quipu_write_latency_seconds` | histogram | 이벤트 하나를 안전하게 적는 데 걸린 시간(재시도 포함) |
+| `quipu_store_bytes` | gauge | 스토어 루트 아래 디스크 사용량(모든 테이블 + DLQ) |
+| `quipu_disk_free_bytes` / `quipu_disk_total_bytes` | gauge | 스토어 루트가 올라간 파일시스템의 여유/전체 |
+| `quipu_writer_alive` | gauge | writer 스레드가 돌고 있으면 1 |
+| `quipu_disk_full` | gauge | ENOSPC 래치가 걸려 있으면 1 |
+| `quipu_disk_low` | gauge | 여유 공간이 경고 기준 아래면 1 |
+| `quipu_verify_runs_total` | counter | 완료된 무결성 검증 횟수 |
+
+알람 출발점: `quipu_writer_alive == 0`, `quipu_disk_full == 1`,
+`rate(quipu_events_lost_total[5m]) > 0`은 즉시 호출,
+`quipu_dlq_entries > 0`이 몇 분 이상 지속되거나 `quipu_disk_low == 1`,
+`quipu_queue_depth`가 계속 자라는 것은 경고로 두면 됩니다.
+
+## 디스크가 가득 차면
+
+스토어 루트가 올라간 볼륨이 차오를 때 무슨 일이 벌어지는지는
+우연이 아니라 정의된 동작입니다.
+
+1. **사전 경고.** 파이프라인이 하우스키핑 주기(30초)마다 여유 공간을
+   재서, `health` 기준 아래로 내려가는 순간 `warn` 로그를 남기고 폴백
+   훅에 한 번 알리며 `quipu_disk_low`를 1로, `/v1/healthz`를
+   `degraded`로 바꿉니다. 손을 쓸 시점은 바로 여기입니다 — 볼륨을
+   늘리거나, `retention_max_bytes`를 낮추거나,
+   `POST /v1/admin/retention`을 돌리세요.
+2. **ENOSPC.** "no space left on device"로 실패한 쓰기는 재시도·백오프
+   루프를 아예 건너뜁니다. 일시 장애가 아니라서 같은 바이트를 다시 써봐야
+   또 실패할 뿐이니까요. 이벤트는 곧장 DLQ로 가는데, DLQ도 보통 같은
+   가득 찬 디스크에 있어 함께 실패하므로 결국 폴백 훅과
+   `quipu_events_lost_total`에 도달합니다. 동시에 디스크 풀 래치가
+   걸립니다. `quipu_disk_full`이 1이 되고 `/v1/healthz`는 503으로 답합니다.
+3. **빠른 거부(선택).** `health.reject_emit_when_disk_full`을 켜면 래치가
+   걸려 있는 동안 `POST /v1/logs`가 즉시 **507**로 답합니다. 어차피 폴백
+   훅으로 갈 이벤트를 큐에 쌓는 대신, 호출자가 대응할 수 있는 역압을
+   돌려주는 겁니다.
+4. **복구는 자동입니다.** 쓰기가 다시 성공하거나 하우스키핑이 여유
+   공간이 경고 기준 위로 돌아온 것을 확인하는 순간 래치가 풀립니다.
+   재시작도, 수동 리셋도 필요 없습니다.
+
+예방 쪽 손잡이는 `retention_max_bytes`입니다. 볼륨 크기보다 작은 용량
+예산을 주면, 보존 정책이 가장 오래된 봉인 세그먼트부터 지우면서 그 안에
+머물게 해줍니다. `retention_days`와 같은 통세그먼트 unlink 방식이라
+지운 뒤에도 무결성 검증은 그대로 통과합니다.
 
 ## v1에서 의도적으로 둔 제약
 

@@ -275,6 +275,12 @@ Configuration, the full HTTP API, and v1 limits live in the
 - **Retention** — `RetentionPolicy::days(90)` drops old data by deleting whole sealed segments:
   one `unlink`, no rewrites.
   Registries are kept so old history stays renderable.
+  Add a byte budget with `.with_max_bytes(n)` for capacity-based protection:
+  the limits combine as **OR** (oldest segments go as soon as *either* age or size is exceeded),
+  the budget covers the logs + relations tables,
+  and because purging is the same whole-segment unlink,
+  integrity verification still passes afterwards.
+  The active segment is never dropped, so the budget is a target, not a hard ceiling.
 - **Durability** — pick `SyncPolicy::Always` (fsync every write), `EveryN(n)`, or `OsManaged`.
 - **Dead-letter queue** — events that exhaust their retries are parked on disk,
   survive restarts, and are replayed with `handle.redrive_dlq(&admin_role)`.
@@ -290,7 +296,25 @@ Configuration, the full HTTP API, and v1 limits live in the
   decryptable across rotations, and a leaked RSA key can be retired for real.
 - **Format versioning** — segment files start with a magic + version byte,
   so future layout changes ship as migrations, not misreads.
-- **Observability** — every write outcome is reported via `tracing`.
+- **Observability** — every write outcome is reported via `tracing`,
+  and counted: `handle.metrics()` returns a snapshot of queue depth, DLQ size,
+  write/retry/park/loss counters and a write-latency histogram,
+  read from shared atomics without touching the writer thread.
+  `quipu-server` exposes the same numbers as Prometheus text on `GET /metrics`
+  and a real health verdict on `GET /v1/healthz`
+  (`ok` / `degraded` on low disk / `unhealthy` with HTTP 503 when the writer
+  thread is dead, the disk is full, or a probe write fails) —
+  metric names and alerting hints live in the
+  [quipu-server README](crates/quipu-server/README.md#metrics).
+- **Disk-full lifecycle** — running out of space is defined behaviour, not luck.
+  Housekeeping warns early (log + fallback hook + `degraded` health)
+  when free space drops below configurable thresholds (default 1 GiB or 10%).
+  An ENOSPC write skips the retry loop — the condition is persistent,
+  so the event routes straight to the DLQ/fallback —
+  and sets a disk-full latch (`unhealthy` health; optional fast-reject of new
+  emits, HTTP 507 in server mode).
+  The latch clears automatically when a write succeeds again
+  or free space recovers above the thresholds.
 
 ### Key rotation
 

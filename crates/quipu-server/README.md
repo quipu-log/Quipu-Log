@@ -35,6 +35,7 @@ cargo run -p quipu-server -- config.json
     "root": "/var/lib/quipu",
     "sync_policy": { "every_n": 64 },
     "retention_days": 365,
+    "retention_max_bytes": 53687091200,
     "plaintext_cache": false
   },
   "keys": {
@@ -57,13 +58,24 @@ cargo run -p quipu-server -- config.json
     },
     "max_concurrent_queries": 2
   },
-  "verify": { "interval_secs": 86400 }
+  "verify": { "interval_secs": 86400 },
+  "health": {
+    "min_free_bytes": 1073741824,
+    "min_free_ratio": 0.10,
+    "reject_emit_when_disk_full": false
+  }
 }
 ```
 
 - `sync_policy`: `"always"`, `"os_managed"`, or `{ "every_n": N }`.
+- `retention_days` / `retention_max_bytes` (both optional): age window and
+  byte budget for the logs + relations tables. They combine as **OR** —
+  the oldest sealed segments are dropped as soon as either limit is exceeded.
 - `verify` (optional): periodic [integrity verification](#integrity-verification) —
   one pass at startup, then one per `interval_secs`. Omit to disable.
+- `health` (optional): disk-space warning thresholds (either bound trips;
+  the values shown are the defaults) and the
+  [disk-full emit behaviour](#disk-full-behaviour).
 - Key material is always referenced by file path, never inlined.
 - Auth is deny-by-default: a role with no grants can do nothing.
   Run one token per calling service so tokens can be revoked individually.
@@ -192,11 +204,13 @@ Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 403 (role lacks the action), 400 (schema/crypto misuse), 404,
 409 (a verification is already running — retry later),
 429 (token at its concurrent-query cap — retry when a query finishes),
-503 (append queue full — back off and retry), or 500.
+503 (append queue full — back off and retry),
+507 (disk full with `reject_emit_when_disk_full` on — back off longer), or 500.
 
 | method & path | action | body / response |
 |---|---|---|
-| `GET /v1/healthz` | — | `ok` |
+| `GET /v1/healthz` | — | `{"status": "ok"/"degraded"/"unhealthy", "reasons": [...]}` — see [Health](#health) |
+| `GET /metrics` | administer | Prometheus text exposition — see [Metrics](#metrics) |
 | `POST /v1/types` | administer | `TypeSchema` JSON → 204. Additive redefinition only. |
 | `GET /v1/types` | query | `[TypeSchema]` |
 | `POST /v1/columns` | administer | `CustomColumnDef` JSON → 204 |
@@ -325,6 +339,92 @@ Two things to know before pointing a cron at it:
   up in the bounded pipeline queue instead of being persisted — fine for
   typical stores, but on a very large store under heavy write load, schedule
   it off-peak or expect some 503s on `POST /v1/logs` during the pass.
+
+## Health
+
+`GET /v1/healthz` (no token) answers
+`{"status": "ok"|"degraded"|"unhealthy", "reasons": [...]}`:
+
+- **`unhealthy`** (HTTP **503**) — events are *not* being persisted:
+  the writer thread is dead, the disk-full latch is set,
+  or a probe write into the store root just failed.
+- **`degraded`** (HTTP **200**) — writes still work, but free disk space is
+  below the `health` thresholds. 200 on purpose: a load balancer must not
+  eject an instance that is still persisting events; the body carries the
+  warning for monitoring to alert on.
+- **`ok`** (HTTP **200**).
+
+Each check runs live per request: writer liveness and the disk-full latch
+from the pipeline, plus an actual create-write-fsync-delete probe in the
+store root and a fresh free-space measurement.
+
+> Compatibility: before v0.2 this endpoint returned plain-text `ok`
+> unconditionally. Monitors matching on the body must switch to the status
+> code or the JSON `status` field.
+
+## Metrics
+
+`GET /metrics` renders Prometheus text format (v0.0.4). It sits behind a
+bearer token with `administer`, like the rest of the operational surface —
+give Prometheus its own token:
+
+```yaml
+scrape_configs:
+  - job_name: quipu
+    authorization: { credentials: <token> }
+    static_configs: [{ targets: ["quipu-host:7700"] }]
+```
+
+| metric | type | meaning |
+|---|---|---|
+| `quipu_queue_depth` | gauge | events enqueued, not yet picked up by the writer |
+| `quipu_dlq_entries` | gauge | events parked in the dead-letter queue |
+| `quipu_writes_ok_total` | counter | events durably appended |
+| `quipu_write_retries_total` | counter | failed write attempts that were retried |
+| `quipu_writes_parked_total` | counter | events that exhausted retries (or hit disk-full) → DLQ |
+| `quipu_events_lost_total` | counter | store *and* DLQ both failed; fallback hook only |
+| `quipu_emit_rejected_total{reason}` | counter | emits bounced at the caller: `queue_full` / `disk_full` |
+| `quipu_write_latency_seconds` | histogram | wall time to durably persist one event (incl. retries) |
+| `quipu_store_bytes` | gauge | bytes on disk under the store root (all tables + DLQ) |
+| `quipu_disk_free_bytes` / `quipu_disk_total_bytes` | gauge | filesystem holding the store root |
+| `quipu_writer_alive` | gauge | 1 while the writer thread runs |
+| `quipu_disk_full` | gauge | 1 while the ENOSPC latch is set |
+| `quipu_disk_low` | gauge | 1 while free space is below the warning thresholds |
+| `quipu_verify_runs_total` | counter | completed integrity verification passes |
+
+Alerting starter pack: page on `quipu_writer_alive == 0`, `quipu_disk_full
+== 1` or `rate(quipu_events_lost_total[5m]) > 0`; warn on `quipu_dlq_entries
+> 0` for more than a few minutes, `quipu_disk_low == 1`, or a growing
+`quipu_queue_depth`.
+
+## Disk-full behaviour
+
+What happens when the volume under the store root fills up is defined, not
+emergent:
+
+1. **Early warning.** Every housekeeping interval (30s) the pipeline
+   measures free space. Crossing below the `health` thresholds logs a
+   `warn`, notifies the fallback hook once, flips `quipu_disk_low` to 1 and
+   turns `/v1/healthz` `degraded`. This is the moment to act — grow the
+   volume, lower `retention_max_bytes`, or run `POST /v1/admin/retention`.
+2. **ENOSPC.** A write that fails with "no space left on device" skips the
+   retry/backoff loop entirely (the condition is persistent; rewriting the
+   same bytes cannot succeed) and goes straight to the DLQ — which usually
+   sits on the same full disk and also fails, so the event reaches the
+   fallback hook and `quipu_events_lost_total`. The disk-full latch is set:
+   `quipu_disk_full` reads 1 and `/v1/healthz` answers 503.
+3. **Fast reject (opt-in).** With `health.reject_emit_when_disk_full` set,
+   `POST /v1/logs` answers **507** immediately while the latch is set,
+   instead of queueing events that are bound for the fallback hook anyway —
+   callers get backpressure they can act on.
+4. **Recovery is automatic.** The latch clears as soon as a write succeeds
+   again, or when housekeeping measures free space back above the warning
+   thresholds. No restart, no manual reset.
+
+The matching *prevention* knob is `retention_max_bytes`: give the store a
+byte budget below the volume size and retention keeps it there by dropping
+the oldest sealed segments — same whole-segment unlink as `retention_days`,
+so integrity verification still passes afterwards.
 
 ## Limits (v1, by design)
 
