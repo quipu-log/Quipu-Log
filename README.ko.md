@@ -3,7 +3,8 @@
 [![CI](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
-[![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](CHANGELOG.md)
+[![crates.io](https://img.shields.io/crates/v/quipu-core.svg)](https://crates.io/crates/quipu-core)
+[![docs.rs](https://img.shields.io/docsrs/quipu-core.svg)](https://docs.rs/quipu-core)
 
 [English](README.md) | 한국어
 
