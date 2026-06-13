@@ -31,7 +31,10 @@ All five crates share one version (`[workspace.package] version` in the root
    to `## [X.Y.Z] - YYYY-MM-DD` and add a fresh empty `## [Unreleased]` above it.
    A format/DLQ/API contract change is a breaking change — see the compatibility
    policy at the top of the changelog.
-4. **Update docs if needed** — README (EN/KO), crate docs.
+4. **Finalize the README — this gates the release.** README (EN/KO) and crate
+   docs must be complete and approved *before* you tag. The published crate page
+   on crates.io / docs.rs renders the README, and a published version is
+   permanent, so do not tag against a half-written or unreviewed README.
 5. **Commit** (`chore(release): vX.Y.Z`) and merge to `main`.
 6. **Dry-run locally** (optional but cheap):
    ```sh
