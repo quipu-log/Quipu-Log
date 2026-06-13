@@ -9,13 +9,11 @@ English | [한국어](README.ko.md)
 
 **Tamper-evident audit logging for Rust services. Runs in your process — no database to set up.**
 
-> **Maturity.** 0.x, pre-1.0 — the on-disk format is still settling and APIs can shift within 0.x ([compatibility policy](CHANGELOG.md#compatibility-policy)). Not yet published to crates.io; depend on it by git for now. What's already solid: 158 tests across the workspace, clippy-clean, MSRV 1.89, no `unsafe` outside two `libc::statvfs` calls, and continuous fuzzing — libFuzzer targets for the segment parser and DLQ redrive, plus a SIGKILL crash-injection test, with a smoke run on every PR and long runs nightly. Security policy and threat model: [SECURITY.md](SECURITY.md).
+> **Pre-1.0.** The on-disk format is still settling and APIs can shift within 0.x ([compatibility policy](CHANGELOG.md#compatibility-policy)). Not on crates.io yet — depend on it by git.
 
 Quipu-Log answers questions like: *who changed this document last quarter, and what was it called back then?*
 
 It logs who did what, to which entity, through which API. Each record is hash-chained to the one before it, so a silent edit shows up. And it stores what every entity looked like the moment you wrote the log. Rename a user today, and last month's logs still show — and still find — the old name.
-
-> The name comes from the *quipu*, the knotted-cord records of the Inca. Knots tied along a cord are hard to retie without leaving a mark.
 
 ## Why it exists
 
@@ -77,7 +75,7 @@ let pipeline = AuditPipeline::start(
     PipelineConfig::default(), None /* fallback hook */)?;
 let handle = pipeline.handle();
 
-// 4. Emit events — non-blocking. This call compiles and runs as written.
+// 4. Emit events — non-blocking.
 handle.emit(
     &Role::new("svc"),
     AuditEvent::new(
@@ -94,7 +92,7 @@ handle.emit(
 )?;
 ```
 
-The same snippet runs as a doctest in `quipu-middleware`, so it can't silently rot. A full runnable setup is in [`examples/axum-demo`](examples/axum-demo). For HTTP services you usually don't emit by hand — see the next section.
+A full runnable setup is in [`examples/axum-demo`](examples/axum-demo). For HTTP services you usually don't emit by hand — see the next section.
 
 ## Recording from HTTP
 

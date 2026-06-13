@@ -19,7 +19,7 @@ If you're embedding Quipu-Log in a Rust service, this is your entry point. `quip
 
 ## Quick start
 
-The minimal embedded setup — open a store, start the pipeline, emit — lives in the [root README's Quick start](../../README.md#quick-start) and runs as a doctest here (`cargo test --doc -p quipu-middleware`), so it can't drift from the API. The shape:
+The minimal embedded setup — open a store, start the pipeline, emit — is in the [root README's Quick start](../../README.md#quick-start). The shape:
 
 ```rust,no_run
 use quipu_core::*;

@@ -9,13 +9,11 @@
 
 **Rust 서비스를 위한 변조 감지(tamper-evident) 감사 로그. 라이브러리로 임베드되며, 따로 띄울 데이터베이스가 없습니다.**
 
-> **성숙도.** 0.x, 1.0 이전입니다. 디스크 포맷이 아직 자리를 잡는 중이고 API도 0.x 안에서 바뀔 수 있습니다([호환성 정책](CHANGELOG.md#compatibility-policy)). crates.io에는 아직 올리지 않았으니 당분간 git 의존성으로 가져다 쓰세요. 이미 단단한 것들: 워크스페이스 전체 테스트 158개, clippy 클린, MSRV 1.89, `libc::statvfs` 호출 두 곳 외에는 `unsafe` 없음, 그리고 상시 퍼징 — 세그먼트 파서와 DLQ redrive를 겨냥한 libFuzzer 타깃에 SIGKILL crash 주입 테스트까지, PR마다 스모크가 돌고 긴 버전은 nightly에 돕니다. 보안 정책과 위협 모델은 [SECURITY.md](SECURITY.md)에 있습니다.
+> **1.0 이전.** 디스크 포맷이 아직 자리를 잡는 중이고 API도 0.x 안에서 바뀔 수 있습니다([호환성 정책](CHANGELOG.md#compatibility-policy)). crates.io에는 아직 없으니 git 의존성으로 가져다 쓰세요.
 
 "지난 분기에 이 문서를 누가 고쳤지? 그때 이름은 뭐였더라?" — Quipu-Log는 이런 질문에 답하려고 만들었습니다.
 
 누가 어떤 API로 무엇에 무슨 일을 했는지 기록합니다. 레코드는 저마다 이전 레코드와 해시로 엮여서, 몰래 고치면 흔적이 남습니다. 로그를 쓰던 그 순간의 엔티티 모습도 함께 저장합니다. 그래서 오늘 사용자 이름을 바꿔도 지난달 로그에는 옛 이름이 그대로 찍혀 있고, 옛 이름으로 검색해도 나옵니다.
-
-> 이름은 잉카의 매듭 끈 기록 장치 *키푸(quipu)*에서 따왔습니다. 끈에 줄줄이 묶인 매듭은 하나만 몰래 다시 묶어도 티가 나니까요.
 
 ## 왜 만들었나
 
@@ -77,7 +75,7 @@ let pipeline = AuditPipeline::start(
     PipelineConfig::default(), None /* 폴백 훅 */)?;
 let handle = pipeline.handle();
 
-// 4. 이벤트 발행 — 논블로킹. 이 코드는 그대로 컴파일되고 실행됩니다.
+// 4. 이벤트 발행 — 논블로킹.
 handle.emit(
     &Role::new("svc"),
     AuditEvent::new(
@@ -94,7 +92,7 @@ handle.emit(
 )?;
 ```
 
-같은 코드가 `quipu-middleware`의 doctest로도 돌아가므로, 코드와 따로 놀며 낡을 일이 없습니다. 전체가 돌아가는 예제는 [`examples/axum-demo`](examples/axum-demo)에 있습니다. HTTP 서비스라면 보통 emit을 직접 부를 일이 없으니, 바로 다음 절을 보세요.
+전체가 돌아가는 예제는 [`examples/axum-demo`](examples/axum-demo)에 있습니다. HTTP 서비스라면 보통 emit을 직접 부를 일이 없으니, 바로 다음 절을 보세요.
 
 ## HTTP에서 기록하기
 

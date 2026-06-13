@@ -19,7 +19,7 @@ Rust 서비스에 Quipu-Log를 임베드한다면 여기가 진입점이다. `qu
 
 ## Quick start
 
-스토어 열기 → 파이프라인 시작 → emit 의 최소 임베디드 셋업은 [루트 README의 빠른 시작](../../README.ko.md#빠른-시작)에 있고, 여기서 doctest(`cargo test --doc -p quipu-middleware`)로 돌아가므로 API와 어긋날 수 없다. 골격만 보면:
+스토어 열기 → 파이프라인 시작 → emit 의 최소 임베디드 셋업은 [루트 README의 빠른 시작](../../README.ko.md#빠른-시작)에 있다. 골격만 보면:
 
 ```rust,no_run
 use quipu_core::*;
