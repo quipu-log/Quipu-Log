@@ -7,8 +7,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use quipu_core::{Content, CustomColumnDef, EntityInput, LogQuery, TypeSchema, Value};
 use quipu_middleware::{
-    disk_usage, Action, AuditEvent, AuditHandle, DiskUsage, HealthSnapshot, MetricsSnapshot,
-    MiddlewareError, Role, TargetSpec, VerifyReport,
+    disk_usage, AccessQuery, AccessRecord, Action, AuditEvent, AuditHandle, DiskUsage,
+    HealthSnapshot, MetricsSnapshot, MiddlewareError, Role, TargetSpec, VerifyReport,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -108,6 +108,14 @@ impl AppState {
             tokens_removed = removed,
             "auth section reloaded"
         );
+        // token issue/revoke is admin activity worth a meta-audit record too
+        // (no bearer token behind a SIGHUP — the actor is the host system)
+        self.handle.record_access(AccessRecord::new(
+            "system",
+            "auth_reload",
+            serde_json::json!({ "tokens_added": added, "tokens_removed": removed }).to_string(),
+            None,
+        ));
         Ok(())
     }
 
@@ -157,6 +165,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/entities/{type_name}/{entity_id}/history",
             get(entity_history),
         )
+        .route("/v1/access/query", post(query_access))
         .route("/v1/admin/flush", post(admin_flush))
         .route("/v1/admin/redrive", post(admin_redrive))
         .route("/v1/admin/retention", post(admin_retention))
@@ -690,6 +699,24 @@ async fn count_logs(
     Ok(Json(serde_json::json!({ "count": n })))
 }
 
+// ---- meta-audit (access log) ---------------------------------------------------
+
+/// Read the meta-audit access log: who queried/administered the audit store,
+/// when, with what parameter shapes and result counts. Requires the
+/// `administer` grant (access records reveal who searched what). Only
+/// available when `store.access_log` is enabled in the config (400
+/// otherwise). This read is itself recorded — one `query_access` record per
+/// call, never more (the recording is an append, not a query).
+async fn query_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(q): Json<AccessQuery>,
+) -> Result<Json<Vec<AccessRecord>>, ApiError> {
+    let role = state.authorize(&headers, Action::Administer)?.role;
+    let handle = state.handle.clone();
+    Ok(Json(blocking(move || handle.query_access(&role, q)).await?))
+}
+
 // ---- registry browsing -------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -729,9 +756,14 @@ async fn admin_flush(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    state.authorize(&headers, Action::Administer)?;
+    let role = state.authorize(&headers, Action::Administer)?.role;
     let handle = state.handle.clone();
     blocking(move || handle.flush()).await?;
+    // flush() takes no role (it is also the pipeline's internal barrier), so
+    // the HTTP layer records the admin action itself
+    state
+        .handle
+        .record_access(AccessRecord::new(&role.0, "flush", "{}", None));
     Ok(StatusCode::NO_CONTENT)
 }
 

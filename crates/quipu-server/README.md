@@ -36,7 +36,9 @@ cargo run -p quipu-server -- config.json
     "sync_policy": { "every_n": 64 },
     "retention_days": 365,
     "retention_max_bytes": 53687091200,
-    "plaintext_cache": false
+    "plaintext_cache": false,
+    "access_log": true,
+    "access_retention_days": 90
   },
   "keys": {
     "hmac_key_file": "/etc/quipu/hmac.key",
@@ -71,6 +73,10 @@ cargo run -p quipu-server -- config.json
 - `retention_days` / `retention_max_bytes` (both optional): age window and
   byte budget for the logs + relations tables. They combine as **OR** —
   the oldest sealed segments are dropped as soon as either limit is exceeded.
+- `access_log` (optional, default false): meta-audit — record every query and
+  admin operation against the store in a dedicated access log, readable via
+  `POST /v1/access/query`. `access_retention_days` sets its retention window
+  independently of `retention_days` (omit to keep access records forever).
 - `verify` (optional): periodic [integrity verification](#integrity-verification) —
   one pass at startup, then one per `interval_secs`. Omit to disable.
 - `health` (optional): disk-space warning thresholds (either bound trips;
@@ -219,6 +225,7 @@ Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 | `POST /v1/logs/count` | query | `LogQuery` JSON → `{"count": n}` (no rendering/decryption) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (latest versions) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (oldest first) |
+| `POST /v1/access/query` | administer | `AccessQuery` JSON (`from_micros`/`to_micros`/`actor`/`operation`/`limit`, all optional) → `[AccessRecord]`. Meta-audit: who queried/administered the store. Needs `store.access_log: true` (400 otherwise). Each read is itself recorded, exactly once. |
 | `POST /v1/admin/flush` | administer | fsync everything queued → 204 |
 | `POST /v1/admin/redrive` | administer | `{"redriven": n}` |
 | `POST /v1/admin/retention` | administer | `{"segments_dropped": n}` |

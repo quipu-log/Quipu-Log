@@ -1,3 +1,4 @@
+use crate::access::{AccessQuery, AccessRecord, RESERVED_TYPE_PREFIX};
 use crate::checkpoint::{Checkpoint, CheckpointLog};
 use crate::crypto::{self, KeyRing, KeyVersion, KEYLESS};
 use crate::error::{Error, Result};
@@ -51,6 +52,15 @@ pub struct StoreConfig {
     /// Errors and panics inside the hook are swallowed: availability of the
     /// write path outranks anchoring — export delivery is the hook's job.
     pub anchor: Option<AnchorHook>,
+    /// Opt-in meta-audit: record reads and admin actions against the audit
+    /// store itself in a dedicated access-log table (`root/access/`) — see
+    /// [`crate::access`]. Off by default.
+    pub access_log: bool,
+    /// Retention for the access-log table, independent of the main `retention`
+    /// window. Access records are often kept *shorter* than the audit data
+    /// they describe; the split is possible because the access log lives in
+    /// its own table (retention drops whole segments per table).
+    pub access_retention: RetentionPolicy,
 }
 
 impl StoreConfig {
@@ -63,7 +73,23 @@ impl StoreConfig {
             keys: KeyRing::new(),
             plaintext_cache: false,
             anchor: None,
+            access_log: false,
+            access_retention: RetentionPolicy::keep_forever(),
         }
+    }
+
+    /// Enable the meta-audit access log — see
+    /// [`access_log`](Self::access_log).
+    pub fn access_log(mut self, enabled: bool) -> Self {
+        self.access_log = enabled;
+        self
+    }
+
+    /// Retention window for the access-log table — see
+    /// [`access_retention`](Self::access_retention).
+    pub fn access_retention(mut self, r: RetentionPolicy) -> Self {
+        self.access_retention = r;
+        self
     }
 
     /// Register the external-anchor hook — see [`anchor`](Self::anchor).
@@ -190,6 +216,10 @@ pub struct AuditStore {
     meta: Table<MetaEvent>,
     logs: Table<AuditLog>,
     relations: Table<TargetRelation>,
+    /// Meta-audit table (`Some` iff [`StoreConfig::access_log`]) — see
+    /// [`crate::access`]. Kept apart from `logs` on purpose: independent
+    /// retention, and an access append can never recurse into a query.
+    access: Option<Table<AccessRecord>>,
     registries: HashMap<String, TypeRegistry>,
     custom_columns: HashMap<String, CustomColumnDef>,
     checkpoints: CheckpointLog,
@@ -217,6 +247,11 @@ impl AuditStore {
             Table::open(&cfg.root.join("meta"), cfg.max_segment_bytes)?;
         let logs = Table::open(&cfg.root.join("logs"), cfg.max_segment_bytes)?;
         let relations = Table::open(&cfg.root.join("relations"), cfg.max_segment_bytes)?;
+        let access = if cfg.access_log {
+            Some(Table::open(&cfg.root.join("access"), cfg.max_segment_bytes)?)
+        } else {
+            None
+        };
 
         let mut registries = HashMap::new();
         let mut custom_columns = HashMap::new();
@@ -248,6 +283,7 @@ impl AuditStore {
             meta,
             logs,
             relations,
+            access,
             registries,
             custom_columns,
             checkpoints,
@@ -267,6 +303,15 @@ impl AuditStore {
     /// change would split the search index keys (old values silently stop
     /// matching probes), breaking the "past values stay searchable" promise.
     pub fn define_type(&mut self, schema: TypeSchema) -> Result<()> {
+        if schema.type_name.starts_with(RESERVED_TYPE_PREFIX) {
+            return Err(Error::Schema(format!(
+                "type name '{}' uses the reserved prefix '{RESERVED_TYPE_PREFIX}' — that \
+                 namespace belongs to quipu's internal record kinds (e.g. the \
+                 '{}' meta-audit type)",
+                schema.type_name,
+                crate::access::ACCESS_TYPE
+            )));
+        }
         if let Some(existing) = self.registries.get(&schema.type_name) {
             for old in &existing.schema().fields {
                 match schema.field(&old.name) {
@@ -567,6 +612,9 @@ impl AuditStore {
     pub fn sync(&mut self) -> Result<()> {
         self.sync_all()?;
         self.meta.sync()?;
+        if let Some(access) = self.access.as_mut() {
+            access.sync()?;
+        }
         Ok(())
     }
 
@@ -584,6 +632,9 @@ impl AuditStore {
         self.logs.verify()?;
         self.relations.verify()?;
         self.meta.verify()?;
+        if let Some(access) = self.access.as_mut() {
+            access.verify()?;
+        }
         for reg in self.registries.values_mut() {
             reg.verify()?;
         }
@@ -806,19 +857,28 @@ impl AuditStore {
     /// or both — they combine as OR; see [`RetentionPolicy`]). Returns
     /// segments dropped.
     pub fn apply_retention(&mut self) -> Result<usize> {
-        let mut dropped = 0usize;
-        if let Some(cutoff) = self.cfg.retention.cutoff_micros(crate::time::now_micros()) {
-            dropped += self.logs.purge_older_than(cutoff)?;
-            dropped += self.relations.purge_older_than(cutoff)?;
+        let now = crate::time::now_micros();
+        let mut dropped_main = 0;
+        if let Some(cutoff) = self.cfg.retention.cutoff_micros(now) {
+            dropped_main += self.logs.purge_older_than(cutoff)?;
+            dropped_main += self.relations.purge_older_than(cutoff)?;
         }
         if let Some(budget) = self.cfg.retention.max_bytes {
-            dropped += self.purge_to_byte_budget(budget)?;
+            dropped_main += self.purge_to_byte_budget(budget)?;
         }
-        if dropped > 0 {
+        if dropped_main > 0 {
             // re-anchor after the unlink: the previous latest checkpoint may
             // point into a purged segment, and verification must not depend
             // on records that retention legitimately removed
             self.write_checkpoint()?;
+        }
+        // the access log has its own, independent window (often shorter than
+        // the main one). It is not covered by checkpoints, so no re-anchor.
+        let mut dropped = dropped_main;
+        if let Some(access) = self.access.as_mut() {
+            if let Some(cutoff) = self.cfg.access_retention.cutoff_micros(now) {
+                dropped += access.purge_older_than(cutoff)?;
+            }
         }
         Ok(dropped)
     }
@@ -941,8 +1001,74 @@ impl AuditStore {
     /// Run a query. Targets and actor are resolved to the registry versions
     /// referenced at write time, so renamed entities show their historical
     /// values. Convenience for [`snapshot`](Self::snapshot)`()?.query(q)`.
+    ///
+    /// With [`StoreConfig::access_log`] enabled, the query is meta-audited
+    /// under actor `"local"` (this direct embedded API has no caller
+    /// identity; use [`query_as`](Self::query_as) to attribute it). The
+    /// recording is fail-closed: if the access record cannot be persisted,
+    /// the query errors — the synchronous embedded API favors the regulatory
+    /// guarantee, while the async pipeline above favors availability.
     pub fn query(&mut self, q: &LogQuery) -> Result<Vec<LogView>> {
-        self.snapshot()?.query(q)
+        self.query_as("local", q)
+    }
+
+    /// [`query`](Self::query) attributed to a named actor in the access log.
+    pub fn query_as(&mut self, actor: &str, q: &LogQuery) -> Result<Vec<LogView>> {
+        let hits = self.snapshot()?.query(q)?;
+        if self.access.is_some() {
+            self.record_access(AccessRecord::new(
+                actor,
+                "query_logs",
+                crate::access::summarize_log_query(q),
+                Some(hits.len() as u64),
+            ))?;
+        }
+        Ok(hits)
+    }
+
+    // ---- meta-audit (access log) -------------------------------------------
+
+    /// Whether the meta-audit access log is enabled.
+    pub fn access_enabled(&self) -> bool {
+        self.access.is_some()
+    }
+
+    /// Append one meta-audit record. A no-op when [`StoreConfig::access_log`]
+    /// is off, so callers can record unconditionally. This is a plain append —
+    /// it never reads, so it can never produce another access record
+    /// (self-reference loops are structurally impossible).
+    pub fn record_access(&mut self, rec: AccessRecord) -> Result<()> {
+        let Some(access) = self.access.as_mut() else {
+            return Ok(());
+        };
+        let ts = rec.timestamp;
+        access.append(&rec, ts)?;
+        access.flush()?;
+        Ok(())
+    }
+
+    /// Read meta-audit records (oldest first) matching the filter. Errors
+    /// when the access log is not enabled. Note: this is a *read* of the
+    /// access log — callers exposing it (e.g. the server) record it as an
+    /// access in turn; the recording itself is an append and does not recurse.
+    pub fn access_records(&mut self, q: &AccessQuery) -> Result<Vec<AccessRecord>> {
+        let Some(access) = self.access.as_mut() else {
+            return Err(Error::Schema(
+                "the access log is not enabled — set StoreConfig::access_log".into(),
+            ));
+        };
+        let mut out = Vec::new();
+        for rec in access.scan()? {
+            let rec = rec?;
+            if !q.matches(&rec) {
+                continue;
+            }
+            out.push(rec);
+            if q.limit.is_some_and(|n| out.len() >= n) {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Run a query and get one page plus a continuation cursor. Convenience
