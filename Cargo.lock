@@ -1152,6 +1152,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "quipu-client"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "quipu-core",
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "quipu-core"
 version = "0.1.0"
 dependencies = [
@@ -1166,6 +1178,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "quipu-mcp"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

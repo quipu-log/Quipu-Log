@@ -31,5 +31,5 @@ pub use permissions::{Action, PermissionPolicy, Role};
 pub use quipu_core::{AccessQuery, AccessRecord};
 pub use pipeline::{
     AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig,
-    RedriveReport, VerifyReport,
+    RedriveReport, SinkFn, VerifyReport,
 };

@@ -102,6 +102,19 @@ pub struct VerifyReport {
 /// DLQ itself failed). Lets the host page someone, mirror to stderr, etc.
 pub type FallbackFn = Arc<dyn Fn(&AuditEvent, &str) + Send + Sync>;
 
+/// Called once per event **after** it is durably written, with the new log's
+/// id — the hook for mirroring the audit trail to an external SIEM
+/// (syslog/webhook/...). Fires on success only: a DLQ-parked event reaches
+/// [`FallbackFn`], not this, so the mirror never carries an event the store
+/// itself rejected.
+///
+/// It runs on the writer thread, in line with persistence, so it **must not
+/// block**: a real sink hands the event to its own bounded queue and returns
+/// immediately (see `quipu-server`'s syslog sink). A panic inside it is caught
+/// and logged rather than killing the writer — like the store's anchor hook,
+/// durability of the write path outranks delivery of the mirror.
+pub type SinkFn = Arc<dyn Fn(&AuditEvent, Uid) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct PipelineConfig {
     /// Bounded queue between the host app and the writer thread.
@@ -123,6 +136,8 @@ pub struct PipelineConfig {
     /// default: queued events would still be persisted if space frees up
     /// before they reach the writer.
     pub reject_emit_when_disk_full: bool,
+    /// Optional write-success mirror for SIEM forwarding (see [`SinkFn`]).
+    pub sink: Option<SinkFn>,
 }
 
 impl Default for PipelineConfig {
@@ -135,6 +150,7 @@ impl Default for PipelineConfig {
             dlq_dir: None,
             disk_thresholds: DiskThresholds::default(),
             reject_emit_when_disk_full: false,
+            sink: None,
         }
     }
 }
@@ -942,6 +958,17 @@ impl Worker {
                         tracing::info!("audit store writable again; disk-full latch cleared");
                     }
                     tracing::debug!(%log_id, method = %event.method, url = %event.url, "audit log written");
+                    if let Some(sink) = &self.cfg.sink {
+                        // the mirror is best-effort and outside the durability
+                        // guarantee: a panicking sink must not take down the
+                        // writer thread or lose the event we just persisted
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            sink(&event, log_id)
+                        }));
+                        if r.is_err() {
+                            tracing::error!("audit sink panicked; event was still persisted");
+                        }
+                    }
                     return;
                 }
                 Err(e) if e.is_storage_full() => {

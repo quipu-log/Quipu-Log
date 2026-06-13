@@ -1,6 +1,6 @@
 use quipu_core::AuditStore;
 use quipu_middleware::{AuditPipeline, PermissionPolicy};
-use quipu_server::{router, AppState, ServerConfig};
+use quipu_server::{router, AppState, ServerConfig, SyslogSink};
 
 fn usage() -> ! {
     eprintln!("usage: quipu-server <config.json>          serve");
@@ -104,6 +104,29 @@ async fn main() {
         }
     };
 
+    // SIEM forwarding (opt-in `sink` section): each durably-written event is
+    // mirrored to syslog. Hold the handle for the process lifetime so its
+    // sender thread keeps draining; dropping it would close the mirror.
+    let mut pipeline_cfg = cfg.pipeline_config();
+    let _syslog_sink = match &cfg.sink {
+        Some(s) => {
+            let app = s.app_name.as_deref().unwrap_or("quipu-server");
+            let cap = s.queue_capacity.unwrap_or(16_384);
+            match SyslogSink::new(&s.syslog_udp, app, cap) {
+                Ok(sink) => {
+                    pipeline_cfg.sink = Some(sink.sink());
+                    tracing::info!(collector = %s.syslog_udp, "syslog SIEM mirror enabled");
+                    Some(sink)
+                }
+                Err(e) => {
+                    eprintln!("failed to set up syslog sink '{}': {e}", s.syslog_udp);
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
     // the pipeline is only reachable through the HTTP handlers here, and
     // those gate every call against the hot-reloadable AppState policy — so
     // the pipeline's own (start-time-frozen) policy must not also enforce,
@@ -112,7 +135,7 @@ async fn main() {
         store,
         store_root.clone(),
         PermissionPolicy::allow_all(),
-        cfg.pipeline_config(),
+        pipeline_cfg,
         None,
     ) {
         Ok(p) => p,
@@ -129,7 +152,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let state = AppState::new(pipeline.handle(), auth_state, store_root);
+    let mut state = AppState::new(pipeline.handle(), auth_state, store_root);
+    if let Some(idem) = &cfg.idempotency {
+        state = state.idempotency_window(idem.window);
+    }
 
     // SIGHUP = re-read the config file and swap the auth section (token
     // issue/revoke without dropping connections); reload failures keep the

@@ -1,6 +1,6 @@
 [package]
-name = "quipu-core"
-description = "Embedded, OS-independent audit log storage engine: typed entity registries, field encryption, retention, and time-travel queries."
+name = "quipu-client"
+description = "Reference client for quipu-server: timeouts, exponential backoff with jitter, idempotent retransmission, and an opt-in local disk spool that rides out server outages."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,18 +15,11 @@ readme = "README.md"
 all-features = true
 
 [dependencies]
+quipu-core = { path = "../quipu-core", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-bincode = { workspace = true }
-base64 = { workspace = true }
 crc32fast = { workspace = true }
-sha2 = { workspace = true }
-hmac = { workspace = true }
-aes-gcm = { workspace = true }
-rsa = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-# tests build a public-key-only KeyRing (write-only deployment) from PEM
-rsa = { workspace = true }

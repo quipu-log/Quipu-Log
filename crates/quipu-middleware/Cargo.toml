@@ -5,9 +5,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-quipu-core = { path = "../quipu-core" }
+# version alongside path so `cargo publish` resolves it from crates.io
+quipu-core = { path = "../quipu-core", version = "0.1.0" }
 serde = { workspace = true }
 bincode = { workspace = true }
 serde_json = { workspace = true }

@@ -307,6 +307,49 @@ Reading it back: embedded, `handle.query_access(&admin_role, AccessQuery::defaul
 with the `administer` grant, enabled via `store.access_log: true` /
 `store.access_retention_days` in the config.
 
+## Availability and scope: a single node, on purpose
+
+The daemon is one process, and that is a design decision, not a missing feature.
+A single writer is what lets the store guard its root with one file lock
+and keep one unbroken hash chain per table —
+the tamper-evidence is simple precisely because nothing else writes.
+Multi-node replication would buy availability at the cost of that simplicity:
+two writers means either a consensus protocol on the chain head
+or a reconciliation story for divergent chains, and a bug in either
+turns "the log proves it wasn't altered" into "the log probably wasn't altered."
+We would rather keep the proof and solve availability where it is cheap — at the client.
+
+The cost of one node is honest: **while the daemon is down or its write queue is full,
+every calling service's audit trail stalls.**
+For audit logs that matters more than for ordinary data —
+a dropped record is a compliance hole, not a refresh-and-retry.
+So the contract pushes durability across an outage to the sender, with two server-side guarantees to lean on:
+
+- **Idempotency keys.** `POST /v1/logs` accepts an `Idempotency-Key` header and
+  remembers recently accepted keys, so a client that retries a request it
+  could not confirm does not create a second record.
+- **Client-set occurrence time.** An event carries its own `occurred_at`, which
+  the log keeps verbatim. An event delivered minutes late — after retries, or
+  replayed from a client's disk buffer — still records *when the action
+  happened*, so lateness never shows in the final log.
+
+`quipu-client` is the reference implementation of the sender side of that contract:
+idempotent retransmission, exponential backoff with jitter, and an opt-in local
+disk spool that rides out an outage and replays once the daemon returns.
+It carries no HTTP dependency — you adapt it to your HTTP library through a one-method trait.
+See its [README](crates/quipu-client/README.md).
+
+For planned downtime or a failed node, recover by **cold standby**, not live failover:
+sealed segments are immutable, so they copy safely at any time;
+only the active segment and the registry tail need a `flush` (or a clean shutdown) before the copy.
+Stand the daemon up on the standby host against the copied root —
+it takes the file lock, truncates any torn tail, and is writable again.
+Restart is bounded by the size of the *active* segment, not the whole store,
+because sealed segments are never rescanned;
+clients hold their events in the spool across the gap.
+The step-by-step procedure is in the
+[quipu-server README](crates/quipu-server/README.md#cold-standby-failover).
+
 ## Operational notes
 
 - **Permissions** — role-based `Emit` / `Query` / `Administer` grants,
@@ -354,6 +397,13 @@ with the `administer` grant, enabled via `store.access_log: true` /
   emits, HTTP 507 in server mode).
   The latch clears automatically when a write succeeds again
   or free space recovers above the thresholds.
+- **Export** — `POST /v1/logs/export` dumps a query's hits as newline-delimited
+  JSON (`application/x-ndjson`) for auditor handoff and SIEM ingestion; scope it
+  with a time range, since it is a full scan.
+- **SIEM forwarding** — opt into a syslog (RFC 5424/UDP) mirror of every written
+  event with the server's `sink` config section; it is best-effort and never
+  back-pressures the write path. Other transports plug in as a
+  `quipu_middleware::SinkFn`.
 
 ### Key rotation
 
@@ -408,6 +458,30 @@ low-entropy values; rotation only protects writes from then on). And re-key
 covers the registries, not log rows — `method`/`url`/`content` are plaintext
 by design and have no keys to rotate.
 
+### Backing up a live store
+
+A clean backup hinges on one property: **sealed segments are immutable.** Once a
+segment fills and the store rolls to the next, the old file never changes again,
+so it copies safely while the daemon runs — an incremental tool (`rsync`,
+snapshot diff) moves only newly sealed segments and the growing active tail.
+
+For a consistent point-in-time copy, settle the active tail first:
+
+1. `POST /v1/admin/flush` (or stop the daemon cleanly) to fsync the active
+   segment and registry tail. Sealed segments need no flush — they are already
+   final.
+2. Copy the whole store root. A copy taken mid-write without the flush is still
+   *recoverable* — on open the store truncates a torn tail at the last whole,
+   CRC-valid record — but the flush is what makes the copy capture exactly the
+   events acknowledged before it.
+3. Verify a restored copy with `store.verify_integrity()` (or
+   `POST /v1/admin/verify`): it walks every hash chain, so a copy that lost or
+   reordered a segment is caught, not trusted.
+
+Retention drops whole sealed segments by `unlink`; if you need an archive rather
+than deletion, copy segments out **before** the retention window elapses — the
+store does not archive on eviction.
+
 ## Performance
 
 Write-path numbers from `cargo bench -p quipu-middleware --bench write_path`
@@ -453,6 +527,8 @@ smoke; the long runs happen in the nightly CI workflow.
 | `quipu-core` | storage engine, typed registries, field encryption, retention, queries |
 | `quipu-middleware` | event pipeline (DLQ/fallback), pre/post filters, permissions, `tower` proxy layer |
 | `quipu-server` | standalone daemon: the same store behind a token-authenticated HTTP/JSON API |
+| `quipu-client` | reference client for the daemon: idempotent retransmission, backoff, opt-in disk spool |
+| `quipu-mcp` | Model Context Protocol server: exposes the store to an LLM agent (query / history / verify) |
 | `examples/axum-demo` | runnable axum integration |
 
 ## Running the demo and tests

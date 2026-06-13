@@ -247,7 +247,7 @@ async fn full_append_query_flow() {
     pipeline.shutdown();
 }
 
-/// Meta-audit through the HTTP surface: queries and admin calls leave access
+
 /// records with the token's role as actor; reading them needs `administer`;
 /// reading them grows the log by exactly one record per read; search probe
 /// values never appear in the records.
@@ -361,6 +361,160 @@ async fn access_log_records_queries_and_admin_ops() {
 
     pipeline.shutdown();
 }
+
+/// Like [`send`] but with an `Idempotency-Key` header on the request.
+async fn send_idem(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    key: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .header("idempotency-key", key)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, body)
+}
+
+#[tokio::test]
+async fn idempotency_key_dedupes_retransmissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // first transmission is queued, the retransmission is absorbed
+    let key = "9c5e7c52-6b14-4be1-9c5d-0a4f9f1a1a01";
+    let body = append_body("alice", "/api/retried");
+    let (status, res) =
+        send_idem(&app, "POST", "/v1/logs", "writer-token", key, body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{res}");
+    assert_eq!(res["status"], "queued");
+    let (status, res) =
+        send_idem(&app, "POST", "/v1/logs", "writer-token", key, body.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{res}");
+    assert_eq!(res["status"], "duplicate");
+
+    // a different key is a different event
+    let (status, res) =
+        send_idem(&app, "POST", "/v1/logs", "writer-token", "other-key", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{res}");
+    assert_eq!(res["status"], "queued");
+
+    let (status, _) = send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // exactly two records: the retransmission never reached the store
+    let (status, hits) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{hits}");
+    assert_eq!(hits["logs"].as_array().unwrap().len(), 2);
+
+    // a malformed key is rejected up front
+    let (status, _) = send_idem(
+        &app,
+        "POST",
+        "/v1/logs",
+        "writer-token",
+        &"x".repeat(200),
+        append_body("alice", "/api/x"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn export_returns_ndjson_one_line_per_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+    send(&app, "POST", "/v1/types", Some("admin-token"), Some(user_schema())).await;
+    for url in ["/api/a", "/api/b"] {
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/logs",
+            Some("writer-token"),
+            Some(append_body("alice", url)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+
+    // export is query-gated and returns x-ndjson: one JSON object per line
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/export",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = body.as_str().expect("ndjson body is text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "two records, two lines: {text:?}");
+    for line in lines {
+        let v: Value = serde_json::from_str(line).expect("each line is valid JSON");
+        assert_eq!(v["actor"]["entity_id"], "alice");
+    }
+
+    // a writer (emit-only) cannot export
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/export",
+        Some("writer-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn openapi_is_served_unauthenticated_and_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+    // no token required — it is an interface description, not data
+    let (status, body) = send(&app, "GET", "/v1/openapi.json", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"], "3.1.0");
+    assert!(body["paths"]["/v1/logs/export"].is_object());
+    assert!(body["paths"]["/v1/logs"]["post"].is_object());
+    pipeline.shutdown();
+}
+
 
 #[tokio::test]
 async fn auth_and_permission_errors() {

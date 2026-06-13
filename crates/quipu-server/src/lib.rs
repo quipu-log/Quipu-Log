@@ -15,11 +15,13 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod serve;
+pub mod sink;
 
 pub use api::{
     evaluate_health, render_prometheus, router, spawn_periodic_verify, AppState, HealthReport,
-    QuerySlot, VerifyGuard,
+    QuerySlot, VerifyGuard, DEFAULT_IDEMPOTENCY_WINDOW, IDEMPOTENCY_HEADER,
 };
 pub use auth::{sha256_hex, AuthState, TokenMap};
 pub use config::ServerConfig;
 pub use serve::{bind, serve};
+pub use sink::SyslogSink;

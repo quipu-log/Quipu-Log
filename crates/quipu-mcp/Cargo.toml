@@ -1,0 +1,21 @@
+[package]
+name = "quipu-mcp"
+description = "Model Context Protocol server exposing a Quipu-Log audit store to LLM agents: query logs, walk entity history, and verify store integrity in natural language — over the same token-authenticated HTTP API a human auditor uses."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
