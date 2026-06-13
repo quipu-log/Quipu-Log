@@ -1,8 +1,15 @@
 # Quipu-Log
 
+[![CI](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
+[![Status](https://img.shields.io/badge/status-pre--1.0-orange.svg)](CHANGELOG.md)
+
 English | [한국어](README.ko.md)
 
 **Tamper-evident audit logging for Rust services. Runs in your process — no database to set up.**
+
+> **Maturity.** 0.x, pre-1.0 — the on-disk format is still settling and APIs can shift within 0.x ([compatibility policy](CHANGELOG.md#compatibility-policy)). Not yet published to crates.io; depend on it by git for now. What's already solid: 158 tests across the workspace, clippy-clean, MSRV 1.89, no `unsafe` outside two `libc::statvfs` calls, and continuous fuzzing — libFuzzer targets for the segment parser and DLQ redrive, plus a SIGKILL crash-injection test, with a smoke run on every PR and long runs nightly. Security policy and threat model: [SECURITY.md](SECURITY.md).
 
 Quipu-Log answers questions like: *who changed this document last quarter, and what was it called back then?*
 
@@ -24,7 +31,7 @@ Quipu-Log treats all three as design requirements:
 
 - **Tampering shows.** Storage is append-only. Every record carries a SHA-256 hash chained to the previous one, across file boundaries. `store.verify_integrity()` finds the first record edited in place, or the segment swapped out. A patched-up CRC won't hide it.
 - **History keeps its context.** People and things are stored as versioned entities. Old logs render and match the values that were true when they were written.
-- **Nothing extra to run.** The store is a directory, managed with plain `std::fs`. No daemon, no external dependency. A crash recovers by truncating the torn tail. Same behavior on every OS.
+- **No database to run — but key state to manage.** The store is a directory, managed with plain `std::fs`. No daemon, no external dependency, and a crash recovers by truncating the torn tail, the same way on every OS. What you *do* take on is keys: protect a field and you own its encryption keys, where a lost key means logs you can't read. That's the real operational cost here — see [Key management](#key-management).
 - **Writes don't block your handler.** Events go through an async pipeline: retries, a disk-backed dead-letter queue, and a fallback hook you can wire to your pager.
 
 ## How it works
@@ -70,11 +77,24 @@ let pipeline = AuditPipeline::start(
     PipelineConfig::default(), None /* fallback hook */)?;
 let handle = pipeline.handle();
 
-// 4. Emit events — non-blocking.
-handle.emit(&Role::new("svc"), AuditEvent::new(...).target(...))?;
+// 4. Emit events — non-blocking. This call compiles and runs as written.
+handle.emit(
+    &Role::new("svc"),
+    AuditEvent::new(
+        "default_actor",
+        EntityInput::new("svc-1").text("name", "billing-service"),
+        "PUT",
+        "/api/docs/42",
+        Content::Text("saved".into()),
+    )
+    .target(TargetSpec::new(
+        "default_target",
+        EntityInput::new("42").text("name", "doc-42"),
+    )),
+)?;
 ```
 
-A full runnable setup is in [`examples/axum-demo`](examples/axum-demo). For HTTP services you usually don't emit by hand — see the next section.
+The same snippet runs as a doctest in `quipu-middleware`, so it can't silently rot. A full runnable setup is in [`examples/axum-demo`](examples/axum-demo). For HTTP services you usually don't emit by hand — see the next section.
 
 ## Recording from HTTP
 
@@ -224,13 +244,45 @@ Access records live in their own table (`root/access/`), with their own tamper-e
 
 To read them back: embedded, `handle.query_access(&admin_role, AccessQuery::default())`; in server mode, `POST /v1/access/query` with the `administer` grant.
 
-## Why no distributed storage
+## What tamper-evidence covers
 
-Quipu-Log doesn't replicate across machines. It runs on one node, and that's down to how the tamper-evidence works.
+Quipu-Log makes tampering *evident*; it does not make storage *immutable*. Knowing exactly where that line falls is the difference between a guarantee you have and one you only think you have.
 
-Every record is hash-chained to the one before it, in a single line. That line only holds if one writer owns it. Add a second node and the chain forks; putting the forks back together takes consensus between nodes, and one bug in that consensus is enough to turn "this log wasn't altered" into "probably wasn't." Replication would buy availability at the price of the one thing the whole project exists to provide. So it doesn't replicate.
+The hash chain **on its own** catches:
 
-The price of that choice is real: **when the node is down — daemon dead, or write queue full — every calling service's audit trail stalls in the meantime.** For an audit log, a missing record can't be filled in later, and that gap is itself a compliance problem.
+- **Accidental corruption** — a torn write, bit rot, a truncated tail.
+- **Naive tampering** — a record edited in place, or a whole segment swapped out. `verify_integrity()` reports the first break.
+
+The hash chain on its own does **not** catch:
+
+- **Truncation.** Delete the most recent records, or the whole active segment, and what remains still verifies end to end — it just ends sooner. Nothing inside the chain says how long it was supposed to be.
+- **Full recomputation.** An attacker with write access to the store *and* knowledge of the format can edit a record and recompute every hash from that point on. The chain is unsalted SHA-256, so a rebuilt chain verifies clean.
+
+What closes those two gaps is **signed checkpoints plus external anchoring**. Quipu-Log periodically signs the current chain head; you export that signature somewhere the writer can't reach. A later verification matches the live chain against the anchored checkpoints, so a shortened or rebuilt chain no longer agrees with a signature taken when the log was longer.
+
+That guarantee holds only under two conditions — both your deployment's job, not the library's:
+
+- **The anchor must leave the box.** A checkpoint signature sitting next to the data it protects gets rewritten alongside it. Send it elsewhere: another host, an append-only bucket, a timestamping or transparency service.
+- **The signing key must not live with the data.** Anyone holding the checkpoint key can re-sign a rewritten chain. Anchoring stops an outside attacker and a disk-level actor; it stops a key-holding insider only if the key sits somewhere they don't control — see [Key management](#key-management).
+
+The full scope — what's defended, what's deliberately out, what counts as a vulnerability — is in [SECURITY.md](SECURITY.md).
+
+## Scaling out: sharded chains, not a distributed chain
+
+There is one thing Quipu-Log won't do: spread a **single** hash chain across machines. Every record is chained to the one before it in a single line, and that line only holds if one writer owns it. Put one chain behind multiple writers and it forks; reconciling the forks needs consensus between nodes, and one bug in that consensus turns "this log wasn't altered" into "probably wasn't." That trade — availability bought with the project's whole reason to exist — is the one we refuse.
+
+But "no distributed chain" is not "no horizontal scaling." The invariant that matters is **one writer per chain**, not **one chain total**. Keep that, and you scale on both axes:
+
+- **Writes scale by sharding.** Partition the audit stream by tenant; each shard is an independent single-writer chain + registry + checkpoints — today's exact per-node guarantee, N times over. N shards = N writer threads ≈ N× write throughput. What you give up is a single global order across shards; an audit log rarely needs one (per-shard order + per-shard signed checkpoints is enough). `quipu-middleware`'s `ShardRouter` routes a tenant's writes to its owning shard and fans queries out, merging by timestamp.
+- **Reads scale by replication.** Sealed segments are immutable, so they copy to any number of read-replica query nodes with no effect on integrity — only the active tail lags. That lifts the single-process read ceiling.
+- **Acceptance scales statelessly.** A stateless ingest front behind a load balancer takes requests and routes them to the owning shard by `Idempotency-Key` (already implemented) — request intake scales horizontally while each chain keeps its single writer.
+- **Resharding is add-only.** Chains are append-only and can't be rebalanced, so growth freezes existing shards (read-only, forever single-writer) and routes new writes to new shards via consistent hashing. No record ever moves; a tenant's history simply spans its old (frozen) and current (active) shards, and reads cover both.
+
+The full model — shard key, ordering, resharding, read topology — is in [`docs/specs/horizontal-scaling`](docs/specs/horizontal-scaling/solution-design.md).
+
+### Availability of a single shard
+
+A shard is still one process. **When it's down — daemon dead, or write queue full — every calling service's audit trail to that shard stalls in the meantime.** For an audit log, a missing record can't be filled in later, and that gap is itself a compliance problem.
 
 So surviving an outage is the sender's job, and the server backs it two ways.
 
@@ -240,6 +292,17 @@ So surviving an outage is the sender's job, and the server backs it two ways.
 `quipu-client` is the reference sender: idempotent retransmission, exponential backoff with jitter, and an opt-in local disk spool that rides out an outage and replays when the daemon returns. It has no HTTP dependency — you plug in your own HTTP library through a one-method trait. See its [README](crates/quipu-client/README.md).
 
 For planned downtime or a failed node, recover by **cold standby**, not live failover. Sealed segments are immutable, so they copy safely anytime; only the active segment and registry tail need a `flush` (or a clean shutdown) first. Bring the daemon up on the standby host against the copied root — it takes the lock, truncates any torn tail, and is writable again. Restart time depends on the *active* segment, not the whole store. The step-by-step is in the [quipu-server README](crates/quipu-server/README.md#cold-standby-failover).
+
+## Key management
+
+"No database" is true. "No operational state" is not. The moment you protect a field with `Hmac` or `Rsa`, you take on key management — and for an audit log a lost key isn't a cold cache, it's records you can no longer read or search.
+
+- **Rotation is cheap; re-keying is the exception.** `KeyRing` keys are versioned. Routine rotation only adds a higher version: it signs and encrypts new writes while older versions stay loaded, so old records keep decrypting and matching. You run the offline `rekey` pass only after a key *leak*, to re-wrap existing RSA data under a fresh key so the leaked one can no longer read the store.
+- **Keep old keys, indefinitely.** Old RSA *public* keys verify old checkpoints; old HMAC keys match old search tokens. Drop them and verification and search break — quietly. HMAC fields can't be re-keyed at all (one-way, no plaintext retained), so a leaked HMAC key means its existing digests must be treated as exposed.
+- **A lost key is unrecoverable.** There is no escrow and no backdoor. Lose the RSA private key and every field encrypted under it is gone — ciphertext with no way back. Back the `KeyRing` up separately from the store, and rehearse the restore.
+- **For anchoring to mean anything, separate the signing key.** Checkpoint signatures defend against a key-holding insider *only* if the private key doesn't sit on the node holding the data: a separate signing host, an HSM, or a KMS. Co-locate it and anchoring drops back to a check against outsiders. (Same point as [What tamper-evidence covers](#what-tamper-evidence-covers), from the operator's side.)
+
+Step-by-step rotation and re-key procedures: [quipu-server README](crates/quipu-server/README.md#key-rotation).
 
 ## Operational notes
 
@@ -276,18 +339,25 @@ Caller-side `emit()` latency with `EveryN(64)` and a 32,768-slot queue, over 200
 
 The p50 is just a bounded-channel enqueue — the audited request path normally pays nanoseconds. The tail is backpressure, not disk time on the caller: when fsync stalls the writer long enough to fill the queue, `emit` returns `QueueFull` and the benchmark retries after 50 µs. Size the queue and sync policy for your burst profile; with `OsManaged` the tail disappears, at the cost of trusting the OS page cache on power loss.
 
+### Scale and its limits
+
+Those are throughput figures, not capacity. Two ceilings matter as data accumulates:
+
+- **One writer, one process.** A single thread owns the store — that's what keeps the hash chain a single unbroken line ([why](#scaling-out-sharded-chains-not-a-distributed-chain)). The numbers above are that thread's ceiling; you scale a node by batching and queue sizing, not by adding writers, and past one node you shard by tenant, not replicate. Plan capacity around a sustained single-writer rate, with retention bounding how much history a node carries.
+- **Queries full-scan; the registry index is in memory.** A query scans log segments, and the registry's entity indexes live in RAM (a snapshot clones them, off the write path). Comfortable for millions of records; at hundreds of millions a full-scan query is seconds rather than milliseconds, and the in-memory indexes grow with your distinct-entity count, so the working set has to fit. Keep it bounded: lean on retention, always constrain queries by time range, and add a blind index only on fields you actually search. There's no secondary index over log rows yet — for ad-hoc analytics at that scale, export ([`POST /v1/logs/export`](#operational-notes)) into a dedicated search or warehouse system rather than scanning live.
+
 Robustness gets its own tests: `fuzz/` has libFuzzer targets for the segment parser and DLQ redrive, and `crates/quipu-middleware/tests/` has a concurrent stress test (emit + flush + retention + query, full chain verification after) and a SIGKILL crash-injection test. Every PR runs a short fuzz smoke; long runs happen in nightly CI.
 
 ## Workspace layout
 
 | crate | what it is |
 |---|---|
-| `quipu-core` | storage engine, typed registries, field encryption, retention, queries |
-| `quipu-middleware` | event pipeline (DLQ/fallback), pre/post filters, permissions, `tower` proxy layer |
-| `quipu-server` | standalone daemon: the same store behind a token-authenticated HTTP/JSON API |
-| `quipu-client` | reference client for the daemon: idempotent retransmission, backoff, opt-in disk spool |
-| `quipu-mcp` | Model Context Protocol server: exposes the store to an LLM agent (query / history / verify) |
-| `examples/axum-demo` | runnable axum integration |
+| [`quipu-core`](crates/quipu-core/README.md) | storage engine, typed registries, field encryption, retention, queries |
+| [`quipu-middleware`](crates/quipu-middleware/README.md) | event pipeline (DLQ/fallback), pre/post filters, permissions, `tower` proxy layer, shard router |
+| [`quipu-server`](crates/quipu-server/README.md) | standalone daemon: the same store behind a token-authenticated HTTP/JSON API |
+| [`quipu-client`](crates/quipu-client/README.md) | reference client for the daemon: idempotent retransmission, backoff, opt-in disk spool |
+| [`quipu-mcp`](crates/quipu-mcp/README.md) | Model Context Protocol server: exposes the store to an LLM agent (query / history / verify) |
+| [`examples/axum-demo`](examples/axum-demo) | runnable axum integration |
 
 ## Running the demo and tests
 

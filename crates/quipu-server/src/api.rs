@@ -5,10 +5,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use quipu_core::{Content, CustomColumnDef, EntityInput, LogQuery, TypeSchema, Value};
+use quipu_core::{
+    Content, CustomColumnDef, EntityInput, LogQuery, LogView, QueryPage, TargetSnapshot,
+    TypeSchema, Value,
+};
 use quipu_middleware::{
     disk_usage, AccessQuery, AccessRecord, Action, AuditEvent, AuditHandle, DiskUsage,
-    HealthSnapshot, MetricsSnapshot, MiddlewareError, Role, TargetSpec, VerifyReport,
+    HealthSnapshot, MetricsSnapshot, MiddlewareError, MultiCursor, Role, ShardRouter, TargetSpec,
+    VerifyReport,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -21,8 +25,20 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Clone)]
 pub struct AppState {
+    /// A representative shard handle. In single-store mode it *is* the store; in
+    /// sharded mode it is the lowest-id shard, kept for the shared health flags
+    /// the disk-full tests drive. All data operations go through the helpers
+    /// (which route via [`router`](Self::router) when present), never this field
+    /// directly.
     pub handle: AuditHandle,
+    /// `Some` in sharded mode — every emit/query/admin op routes through it.
+    /// `None` in single-store mode, where [`handle`](Self::handle) is used
+    /// directly (byte- and wire-compatible with the unsharded server).
+    router: Option<Arc<ShardRouter>>,
+    /// Tenant id header (sharded mode). Required on writes, optional on reads.
+    tenant_header: Arc<str>,
     /// Store root directory — health probes write here, `/metrics` sizes it.
+    /// In sharded mode this is the base that contains every `shard-NNNN`.
     store_root: Arc<PathBuf>,
     /// Hot-reloadable auth view (tokens + grants + query cap). All
     /// permission gating happens here at the HTTP layer — the pipeline runs
@@ -115,10 +131,15 @@ pub enum QuerySlot {
     Busy,
 }
 
+/// Default tenant-id header for sharded mode (`config.shards.tenant_header`).
+pub const DEFAULT_TENANT_HEADER: &str = "x-quipu-tenant";
+
 impl AppState {
     pub fn new(handle: AuditHandle, auth: AuthState, store_root: PathBuf) -> Self {
         Self {
             handle,
+            router: None,
+            tenant_header: Arc::from(DEFAULT_TENANT_HEADER),
             store_root: Arc::new(store_root),
             auth: Arc::new(RwLock::new(auth)),
             query_slots: Arc::new(Mutex::new(HashMap::new())),
@@ -126,6 +147,36 @@ impl AppState {
             verify_runs: Arc::new(AtomicU64::new(0)),
             dedup: Arc::new(Mutex::new(DedupWindow::new(DEFAULT_IDEMPOTENCY_WINDOW))),
         }
+    }
+
+    /// Sharded mode: route every operation through `router`. `store_root` is the
+    /// base directory holding the `shard-NNNN` stores (health probe + sizing).
+    /// `tenant_header` names the request header that carries the tenant id.
+    pub fn new_sharded(
+        router: Arc<ShardRouter>,
+        auth: AuthState,
+        store_root: PathBuf,
+        tenant_header: impl Into<String>,
+    ) -> Self {
+        let handle = router
+            .representative_handle()
+            .expect("a sharded router has at least one shard");
+        Self {
+            handle,
+            router: Some(router),
+            tenant_header: Arc::from(tenant_header.into().to_ascii_lowercase().as_str()),
+            store_root: Arc::new(store_root),
+            auth: Arc::new(RwLock::new(auth)),
+            query_slots: Arc::new(Mutex::new(HashMap::new())),
+            verify_running: Arc::new(AtomicBool::new(false)),
+            verify_runs: Arc::new(AtomicU64::new(0)),
+            dedup: Arc::new(Mutex::new(DedupWindow::new(DEFAULT_IDEMPOTENCY_WINDOW))),
+        }
+    }
+
+    /// `true` in sharded mode (writes then require a tenant id).
+    pub fn is_sharded(&self) -> bool {
+        self.router.is_some()
     }
 
     /// Resize the idempotency-key window (config `idempotency.window`).
@@ -181,8 +232,9 @@ impl AppState {
             "auth section reloaded"
         );
         // token issue/revoke is admin activity worth a meta-audit record too
-        // (no bearer token behind a SIGHUP — the actor is the host system)
-        self.handle.record_access(AccessRecord::new(
+        // (no bearer token behind a SIGHUP — the actor is the host system).
+        // In sharded mode it is store-wide, so it lands on every shard.
+        self.record_access_op(AccessRecord::new(
             "system",
             "auth_reload",
             serde_json::json!({ "tokens_added": added, "tokens_removed": removed }).to_string(),
@@ -221,6 +273,247 @@ impl Drop for VerifyGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+/// Backend routing: every handler reaches the store through these, so the
+/// single-store and sharded paths differ in exactly one place. In single mode
+/// they delegate to the one [`AuditHandle`] (today's behavior, byte- and
+/// wire-compatible); in sharded mode they route by tenant through the
+/// [`ShardRouter`] and fan reads out across shards.
+impl AppState {
+    /// Tenant id from the configured header — `None` if absent/blank. Only
+    /// meaningful in sharded mode; single mode ignores it.
+    fn tenant(&self, headers: &HeaderMap) -> Option<String> {
+        headers
+            .get(self.tenant_header.as_ref())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    fn emit_event(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        event: AuditEvent,
+    ) -> Result<(), MiddlewareError> {
+        match &self.router {
+            Some(r) => r.emit(role, tenant.unwrap_or_default(), event).map(|_| ()),
+            None => self.handle.emit(role, event),
+        }
+    }
+
+    /// Fire-and-forget meta-audit record. In sharded mode this is a store-wide
+    /// action (e.g. an admin flush / auth reload) so it lands on every shard.
+    fn record_access_op(&self, rec: AccessRecord) {
+        match &self.router {
+            Some(r) => r.record_access_all(rec),
+            None => self.handle.record_access(rec),
+        }
+    }
+
+    fn query_page_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        q: LogQuery,
+    ) -> Result<QueryPage, MiddlewareError> {
+        match &self.router {
+            None => self.handle.query_page(role, q),
+            Some(r) => {
+                // the wire cursor is an opaque MultiCursor (base64) in sharded
+                // mode; decode it, run the fan-out, re-encode for the next page
+                let cursor = q.cursor.as_deref().and_then(MultiCursor::decode);
+                let limit = q.limit.unwrap_or(usize::MAX).min(100_000);
+                let mut sub = q.clone();
+                sub.cursor = None;
+                let merged = r.query_page(role, tenant, sub, cursor, limit)?;
+                Ok(QueryPage {
+                    logs: merged.logs,
+                    next_cursor: merged.next_cursor.map(|c| c.encode()),
+                    segments_scanned: merged.segments_scanned,
+                })
+            }
+        }
+    }
+
+    fn query_all_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        q: LogQuery,
+    ) -> Result<Vec<LogView>, MiddlewareError> {
+        match &self.router {
+            None => self.handle.query(role, q),
+            Some(r) => r.query(role, tenant, q),
+        }
+    }
+
+    fn count_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        q: LogQuery,
+    ) -> Result<u64, MiddlewareError> {
+        match &self.router {
+            None => self.handle.count(role, q),
+            Some(r) => r.count(role, tenant, q),
+        }
+    }
+
+    fn list_entities_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        type_name: String,
+        include_deleted: bool,
+    ) -> Result<Vec<TargetSnapshot>, MiddlewareError> {
+        match &self.router {
+            None => self.handle.list_entities(role, type_name, include_deleted),
+            Some(r) => r.list_entities(role, tenant, &type_name, include_deleted),
+        }
+    }
+
+    fn entity_history_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        type_name: String,
+        entity_id: String,
+    ) -> Result<Vec<TargetSnapshot>, MiddlewareError> {
+        match &self.router {
+            None => self.handle.entity_history(role, type_name, entity_id),
+            Some(r) => r.entity_history(role, tenant, &type_name, &entity_id),
+        }
+    }
+
+    fn entity_types_op(&self, role: &Role) -> Result<Vec<TypeSchema>, MiddlewareError> {
+        match &self.router {
+            None => self.handle.entity_types(role),
+            Some(r) => r.entity_types(role),
+        }
+    }
+
+    fn define_type_op(&self, role: &Role, schema: TypeSchema) -> Result<(), MiddlewareError> {
+        match &self.router {
+            None => self.handle.define_type(role, schema),
+            Some(r) => r.define_type(role, schema),
+        }
+    }
+
+    fn define_column_op(&self, role: &Role, def: CustomColumnDef) -> Result<(), MiddlewareError> {
+        match &self.router {
+            None => self.handle.define_custom_column(role, def),
+            Some(r) => r.define_custom_column(role, def),
+        }
+    }
+
+    fn query_access_op(
+        &self,
+        role: &Role,
+        q: AccessQuery,
+    ) -> Result<Vec<AccessRecord>, MiddlewareError> {
+        match &self.router {
+            None => self.handle.query_access(role, q),
+            Some(r) => r.query_access(role, q),
+        }
+    }
+
+    fn flush_op(&self) -> Result<(), MiddlewareError> {
+        match &self.router {
+            Some(r) => r.flush(),
+            None => self.handle.flush(),
+        }
+    }
+
+    fn redrive_op(&self, role: &Role) -> Result<quipu_middleware::RedriveReport, MiddlewareError> {
+        match &self.router {
+            None => self.handle.redrive_dlq(role),
+            Some(r) => r.redrive_dlq(role),
+        }
+    }
+
+    fn retention_op(&self, role: &Role) -> Result<usize, MiddlewareError> {
+        match &self.router {
+            None => self.handle.apply_retention(role),
+            Some(r) => r.apply_retention(role),
+        }
+    }
+
+    fn dlq_len_op(&self, role: &Role) -> Result<usize, MiddlewareError> {
+        match &self.router {
+            None => self.handle.dlq_len(role),
+            Some(r) => r.dlq_len(role),
+        }
+    }
+
+    fn verify_op(&self, role: &Role) -> Result<VerifyReport, MiddlewareError> {
+        match &self.router {
+            None => self.handle.verify_integrity(role),
+            Some(r) => r.verify_combined(role),
+        }
+    }
+
+    /// Store-wide health: the writer is alive only if *every* shard's is; the
+    /// disk-full and low-disk flags trip if *any* shard reports them.
+    fn health_op(&self) -> HealthSnapshot {
+        match &self.router {
+            None => self.handle.health(),
+            Some(r) => {
+                let per = r.health();
+                let mut it = per.values();
+                let Some(first) = it.next().cloned() else {
+                    return self.handle.health();
+                };
+                per.values().fold(
+                    HealthSnapshot {
+                        writer_alive: true,
+                        disk_full: false,
+                        low_disk: false,
+                        thresholds: first.thresholds,
+                    },
+                    |acc, h| HealthSnapshot {
+                        writer_alive: acc.writer_alive && h.writer_alive,
+                        disk_full: acc.disk_full || h.disk_full,
+                        low_disk: acc.low_disk || h.low_disk,
+                        thresholds: acc.thresholds,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Store-wide metrics: per-shard counters summed, latency histograms merged.
+    fn metrics_op(&self) -> MetricsSnapshot {
+        match &self.router {
+            None => self.handle.metrics(),
+            Some(r) => aggregate_metrics(r.metrics().into_values()),
+        }
+    }
+}
+
+/// Sum a set of per-shard metrics snapshots into one store-wide snapshot. The
+/// zero base comes from a fresh `PipelineMetrics` so the latency histogram's
+/// bucket bounds are correct even with zero shards.
+fn aggregate_metrics(shards: impl Iterator<Item = MetricsSnapshot>) -> MetricsSnapshot {
+    let mut out = quipu_middleware::PipelineMetrics::default().snapshot();
+    for s in shards {
+        out.queue_depth += s.queue_depth;
+        out.dlq_entries += s.dlq_entries;
+        out.writes_ok += s.writes_ok;
+        out.write_retries += s.write_retries;
+        out.writes_parked += s.writes_parked;
+        out.events_lost += s.events_lost;
+        out.emit_rejected_queue_full += s.emit_rejected_queue_full;
+        out.emit_rejected_disk_full += s.emit_rejected_disk_full;
+        out.write_latency.count += s.write_latency.count;
+        out.write_latency.sum_seconds += s.write_latency.sum_seconds;
+        for (i, (_, c)) in s.write_latency.buckets.iter().enumerate() {
+            out.write_latency.buckets[i].1 += c;
+        }
+    }
+    out
 }
 
 pub fn router(state: AppState) -> Router {
@@ -353,7 +646,7 @@ async fn blocking<T: Send + 'static>(
 /// (Pre-observability versions answered plain-text `ok` unconditionally;
 /// monitors matching on the body must switch to the status code or JSON.)
 async fn healthz(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
-    let snapshot = state.handle.health();
+    let snapshot = state.health_op();
     let root = state.store_root.clone();
     // the probe write and statvfs touch the filesystem: off the async runtime
     let report = tokio::task::spawn_blocking(move || evaluate_health(&snapshot, &root)).await;
@@ -468,8 +761,8 @@ fn probe_write(store_root: &FsPath) -> std::io::Result<()> {
 /// `authorization: { credentials: <token> }`).
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     state.authorize(&headers, Action::Administer)?;
-    let snapshot = state.handle.metrics();
-    let health = state.handle.health();
+    let snapshot = state.metrics_op();
+    let health = state.health_op();
     let verify_runs = state.verify_runs();
     let root = state.store_root.clone();
     // dir walk + statvfs: off the async runtime
@@ -656,8 +949,8 @@ async fn define_type(
     Json(schema): Json<TypeSchema>,
 ) -> Result<StatusCode, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    blocking(move || handle.define_type(&role, schema)).await?;
+    let st = state.clone();
+    blocking(move || st.define_type_op(&role, schema)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -666,8 +959,8 @@ async fn list_types(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TypeSchema>>, ApiError> {
     let role = state.authorize(&headers, Action::Query)?.role;
-    let handle = state.handle.clone();
-    Ok(Json(blocking(move || handle.entity_types(&role)).await?))
+    let st = state.clone();
+    Ok(Json(blocking(move || st.entity_types_op(&role)).await?))
 }
 
 async fn define_column(
@@ -676,8 +969,8 @@ async fn define_column(
     Json(def): Json<CustomColumnDef>,
 ) -> Result<StatusCode, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    blocking(move || handle.define_custom_column(&role, def)).await?;
+    let st = state.clone();
+    blocking(move || st.define_column_op(&role, def)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -732,6 +1025,18 @@ async fn append_log(
     Json(req): Json<AppendRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let role = state.authorize(&headers, Action::Emit)?.role;
+    // in sharded mode a write must name its tenant so it lands on exactly one
+    // chain — silently picking a shard would split a tenant across chains
+    let tenant = state.tenant(&headers);
+    if state.is_sharded() && tenant.is_none() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "{} header is required on writes in sharded mode",
+                state.tenant_header.as_ref()
+            ),
+        });
+    }
     // duplicate detection happens *before* the enqueue: a retransmitted key
     // is acknowledged as already-accepted (202 "duplicate") and never becomes
     // a second audit record. The insert reserves the key; a failed enqueue
@@ -752,7 +1057,7 @@ async fn append_log(
     event.targets = req.targets;
     event.custom = req.custom;
     // enqueue only — 202: durability is the pipeline's job (retries + DLQ)
-    if let Err(e) = state.handle.emit(&role, event) {
+    if let Err(e) = state.emit_event(&role, tenant.as_deref(), event) {
         if let Some(key) = &idem {
             state.dedup.lock().unwrap().remove(key);
         }
@@ -788,9 +1093,13 @@ async fn query_logs(
         slot => slot,
     };
     let role = caller.role;
-    let handle = state.handle.clone();
-    // the scan runs on the snapshot in the blocking pool; appends keep flowing
-    Ok(Json(blocking(move || handle.query_page(&role, q)).await?))
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
+    // the scan runs on the snapshot in the blocking pool; appends keep flowing.
+    // with a tenant it hits one shard's fast path; without, it fans out + merges
+    Ok(Json(
+        blocking(move || st.query_page_op(&role, tenant.as_deref(), q)).await?,
+    ))
 }
 
 /// Total number of matches for a `LogQuery`, without rendering (no registry
@@ -812,8 +1121,9 @@ async fn count_logs(
         slot => slot,
     };
     let role = caller.role;
-    let handle = state.handle.clone();
-    let n = blocking(move || handle.count(&role, q)).await?;
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
+    let n = blocking(move || st.count_op(&role, tenant.as_deref(), q)).await?;
     Ok(Json(serde_json::json!({ "count": n })))
 }
 
@@ -831,8 +1141,8 @@ async fn query_access(
     Json(q): Json<AccessQuery>,
 ) -> Result<Json<Vec<AccessRecord>>, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    Ok(Json(blocking(move || handle.query_access(&role, q)).await?))
+    let st = state.clone();
+    Ok(Json(blocking(move || st.query_access_op(&role, q)).await?))
 }
 
 /// Export matching logs as newline-delimited JSON (`application/x-ndjson`) —
@@ -857,8 +1167,9 @@ async fn export_logs(
         slot => slot,
     };
     let role = caller.role;
-    let handle = state.handle.clone();
-    let views = blocking(move || handle.query(&role, q)).await?;
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
+    let views = blocking(move || st.query_all_op(&role, tenant.as_deref(), q)).await?;
     // serialize off the snapshot into one line per record; a record that fails
     // to serialize aborts the export rather than emitting a truncated line
     let mut body = String::new();
@@ -900,9 +1211,13 @@ async fn list_entities(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<quipu_core::TargetSnapshot>>, ApiError> {
     let role = state.authorize(&headers, Action::Query)?.role;
-    let handle = state.handle.clone();
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
     Ok(Json(
-        blocking(move || handle.list_entities(&role, type_name, params.include_deleted)).await?,
+        blocking(move || {
+            st.list_entities_op(&role, tenant.as_deref(), type_name, params.include_deleted)
+        })
+        .await?,
     ))
 }
 
@@ -912,9 +1227,11 @@ async fn entity_history(
     Path((type_name, entity_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<quipu_core::TargetSnapshot>>, ApiError> {
     let role = state.authorize(&headers, Action::Query)?.role;
-    let handle = state.handle.clone();
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
     Ok(Json(
-        blocking(move || handle.entity_history(&role, type_name, entity_id)).await?,
+        blocking(move || st.entity_history_op(&role, tenant.as_deref(), type_name, entity_id))
+            .await?,
     ))
 }
 
@@ -925,13 +1242,12 @@ async fn admin_flush(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    blocking(move || handle.flush()).await?;
+    let st = state.clone();
+    blocking(move || st.flush_op()).await?;
     // flush() takes no role (it is also the pipeline's internal barrier), so
-    // the HTTP layer records the admin action itself
-    state
-        .handle
-        .record_access(AccessRecord::new(&role.0, "flush", "{}", None));
+    // the HTTP layer records the admin action itself (on every shard in
+    // sharded mode — flush is store-wide)
+    state.record_access_op(AccessRecord::new(&role.0, "flush", "{}", None));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -940,8 +1256,8 @@ async fn admin_redrive(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    let report = blocking(move || handle.redrive_dlq(&role)).await?;
+    let st = state.clone();
+    let report = blocking(move || st.redrive_op(&role)).await?;
     Ok(Json(serde_json::json!({
         "redriven": report.replayed,
         "requeued": report.requeued,
@@ -955,8 +1271,8 @@ async fn admin_retention(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    let n = blocking(move || handle.apply_retention(&role)).await?;
+    let st = state.clone();
+    let n = blocking(move || st.retention_op(&role)).await?;
     Ok(Json(serde_json::json!({ "segments_dropped": n })))
 }
 
@@ -965,8 +1281,8 @@ async fn admin_dlq(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let role = state.authorize(&headers, Action::Administer)?.role;
-    let handle = state.handle.clone();
-    let n = blocking(move || handle.dlq_len(&role)).await?;
+    let st = state.clone();
+    let n = blocking(move || st.dlq_len_op(&role)).await?;
     Ok(Json(serde_json::json!({ "parked": n })))
 }
 
@@ -986,12 +1302,12 @@ async fn admin_verify(
             message: "an integrity verification is already running".into(),
         });
     };
-    let handle = state.handle.clone();
+    let st = state.clone();
     // full-store scan: run it in the blocking pool, holding the guard until
-    // the scan finishes
+    // the scan finishes (every shard, sequentially, in sharded mode)
     let report = blocking(move || {
         let _running = guard;
-        handle.verify_integrity(&role)
+        st.verify_op(&role)
     })
     .await?;
     state.verify_runs.fetch_add(1, Ordering::AcqRel);
@@ -1015,11 +1331,11 @@ pub fn spawn_periodic_verify(state: AppState, interval: Duration) -> tokio::task
                 tracing::warn!("periodic verify skipped: a verification is already running");
                 continue;
             };
-            let handle = state.handle.clone();
+            let st = state.clone();
             let role = role.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let _running = guard;
-                handle.verify_integrity(&role)
+                st.verify_op(&role)
             })
             .await;
             match result {

@@ -30,6 +30,33 @@ pub struct ServerConfig {
     /// Mirror durably-written events to a syslog collector (SIEM forwarding).
     /// Omit to forward nothing.
     pub sink: Option<SinkSection>,
+    /// Horizontal sharding (option B). Omit for single-store mode, which is
+    /// byte-compatible with an unsharded deployment (store lives directly under
+    /// `store.root`). With it, the store is split into N independent chains
+    /// under `store.root/shard-NNNN`, routed by tenant.
+    pub shards: Option<ShardsSection>,
+}
+
+/// Sharded deployment: N independent single-writer stores fronted by one
+/// stateless router (see `docs/specs/horizontal-scaling`). Each shard is a
+/// complete store under `store.root/shard-NNNN`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardsSection {
+    /// Number of shards (ids `0..count`); each a store under
+    /// `store.root/shard-NNNN`. Must be at least 1.
+    pub count: u32,
+    /// Shard ids that are frozen — read-only, never routed new writes (the
+    /// add-only resharding model, ADR-3). Each must be `< count`.
+    #[serde(default)]
+    pub frozen: Vec<u32>,
+    /// Tenant→shard hashing seed. Pin it so every stateless front routes
+    /// identically; it is also recorded as part of the integrity manifest.
+    pub hash_seed: u64,
+    /// Header carrying the tenant id on each request. Defaults to
+    /// `X-Quipu-Tenant`. Required on writes in sharded mode; optional on reads
+    /// (absent ⇒ fan-out across all shards).
+    pub tenant_header: Option<String>,
 }
 
 /// SIEM forwarding over syslog/UDP (RFC 5424). Best-effort: a backlog drops
@@ -341,7 +368,13 @@ impl ServerConfig {
     }
 
     pub fn store_config(&self) -> quipu_core::Result<StoreConfig> {
-        let mut cfg = StoreConfig::new(self.store.root.clone())
+        self.store_config_at(self.store.root.clone())
+    }
+
+    /// Like [`store_config`](Self::store_config) but rooted at `root` — used to
+    /// build each shard's store under `store.root/shard-NNNN` in sharded mode.
+    pub fn store_config_at(&self, root: PathBuf) -> quipu_core::Result<StoreConfig> {
+        let mut cfg = StoreConfig::new(root)
             .keys(self.keyring()?)
             .plaintext_cache(self.store.plaintext_cache);
         if let Some(n) = self.store.max_segment_bytes {

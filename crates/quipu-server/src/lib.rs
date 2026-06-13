@@ -19,7 +19,7 @@ pub mod sink;
 
 pub use api::{
     evaluate_health, render_prometheus, router, spawn_periodic_verify, AppState, HealthReport,
-    QuerySlot, VerifyGuard, DEFAULT_IDEMPOTENCY_WINDOW, IDEMPOTENCY_HEADER,
+    QuerySlot, VerifyGuard, DEFAULT_IDEMPOTENCY_WINDOW, DEFAULT_TENANT_HEADER, IDEMPOTENCY_HEADER,
 };
 pub use auth::{sha256_hex, AuthState, TokenMap};
 pub use config::ServerConfig;
