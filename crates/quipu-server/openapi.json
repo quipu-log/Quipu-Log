@@ -1,0 +1,308 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Quipu-Log Server API",
+    "version": "1.0.0",
+    "description": "HTTP/JSON API for the Quipu-Log audit-log daemon. Multiple services record and search tamper-evident audit logs centrally. All endpoints except /v1/healthz and /v1/openapi.json require a bearer token; permissions are role-based (emit / query / administer). Values are tagged so the non-self-describing disk format can round-trip them: {\"Text\": \"...\"}, {\"Number\": 1.5}, or {\"Json\": \"<json-as-string>\"}.",
+    "license": { "name": "Apache-2.0" }
+  },
+  "servers": [{ "url": "/", "description": "The daemon's bind address" }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "One token per calling service, mapped to a role in the server config."
+      }
+    },
+    "schemas": {
+      "Value": {
+        "description": "Tagged scalar. Exactly one variant.",
+        "oneOf": [
+          { "type": "object", "properties": { "Text": { "type": "string" } }, "required": ["Text"], "additionalProperties": false },
+          { "type": "object", "properties": { "Number": { "type": "number" } }, "required": ["Number"], "additionalProperties": false },
+          { "type": "object", "properties": { "Json": { "type": "string", "description": "JSON encoded as a string" } }, "required": ["Json"], "additionalProperties": false }
+        ]
+      },
+      "Content": {
+        "description": "Audit-log body: free text or structured JSON (as a string).",
+        "oneOf": [
+          { "type": "object", "properties": { "Text": { "type": "string" } }, "required": ["Text"], "additionalProperties": false },
+          { "type": "object", "properties": { "Json": { "type": "string" } }, "required": ["Json"], "additionalProperties": false }
+        ]
+      },
+      "EntityInput": {
+        "type": "object",
+        "description": "An actor or target entity to register/reference.",
+        "properties": {
+          "entity_id": { "type": "string", "description": "Stable external identifier." },
+          "fields": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/Value" } }
+        },
+        "required": ["entity_id"]
+      },
+      "TargetSpec": {
+        "type": "object",
+        "properties": {
+          "entity_type": { "type": "string" },
+          "input": { "$ref": "#/components/schemas/EntityInput" }
+        },
+        "required": ["entity_type", "input"]
+      },
+      "AppendRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "occurred_at": { "type": "integer", "format": "int64", "description": "UTC microseconds since the unix epoch. Optional; defaults to server 'now'. Set it if you queue or retry on the client so the log records when the action actually happened." },
+          "actor_type": { "type": "string" },
+          "actor": { "$ref": "#/components/schemas/EntityInput" },
+          "method": { "type": "string", "description": "HTTP method of the audited call." },
+          "url": { "type": "string", "description": "URL of the audited call." },
+          "content": { "$ref": "#/components/schemas/Content" },
+          "targets": { "type": "array", "items": { "$ref": "#/components/schemas/TargetSpec" }, "default": [] },
+          "custom": { "type": "object", "additionalProperties": { "$ref": "#/components/schemas/Value" }, "default": {} }
+        },
+        "required": ["actor_type", "actor", "method", "url", "content"]
+      },
+      "TargetFilter": {
+        "type": "object",
+        "properties": {
+          "entity_type": { "type": "string" },
+          "field": { "type": "string" },
+          "value": { "$ref": "#/components/schemas/Value" },
+          "mode": { "type": "string", "enum": ["exact", "exact_ci", "prefix", "contains"], "default": "exact" }
+        },
+        "required": ["entity_type", "field", "value"]
+      },
+      "LogQuery": {
+        "type": "object",
+        "description": "All set conditions are AND-ed; everything is optional ({} returns everything up to the limit).",
+        "properties": {
+          "from_micros": { "type": "integer", "format": "int64", "description": "Inclusive lower bound on the log timestamp (UTC micros)." },
+          "to_micros": { "type": "integer", "format": "int64", "description": "Exclusive upper bound on the log timestamp (UTC micros)." },
+          "actor_type": { "type": "string" },
+          "method": { "type": "string" },
+          "url": { "type": "string" },
+          "targets": { "type": "array", "items": { "$ref": "#/components/schemas/TargetFilter" } },
+          "include_past": { "type": "boolean", "default": true, "description": "Match an entity by its past attribute values too (a renamed entity is still found by its old name)." },
+          "limit": { "type": "integer", "description": "Maximum hits returned." }
+        }
+      },
+      "LogView": {
+        "type": "object",
+        "description": "One hit: the recorded log plus actor/target snapshots exactly as they were at record time. Protected fields come back as ciphertext when the server has no private key.",
+        "additionalProperties": true
+      },
+      "TypeSchema": {
+        "type": "object",
+        "description": "Definition of an entity/actor type and its fields. Redefinition is additive only.",
+        "additionalProperties": true,
+        "properties": {
+          "type_name": { "type": "string" },
+          "fields": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        },
+        "required": ["type_name", "fields"]
+      },
+      "CustomColumnDef": {
+        "type": "object",
+        "description": "An extra audit-log column (text / number / json).",
+        "additionalProperties": true,
+        "properties": { "name": { "type": "string" } },
+        "required": ["name"]
+      },
+      "TargetSnapshot": { "type": "object", "additionalProperties": true },
+      "VerifyReport": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "description": "true when every hash chain checked out." },
+          "segments_checked": { "type": "integer" },
+          "log_records": { "type": "integer" },
+          "problems": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["ok", "segments_checked", "log_records", "problems"]
+      },
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "string" } },
+        "required": ["error"]
+      }
+    },
+    "responses": {
+      "Unauthorized": { "description": "Missing or unknown bearer token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Forbidden": { "description": "The token's role lacks the required grant.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  },
+  "security": [{ "bearerAuth": [] }],
+  "paths": {
+    "/v1/healthz": {
+      "get": {
+        "summary": "Liveness check",
+        "security": [],
+        "responses": { "200": { "description": "ok", "content": { "text/plain": { "schema": { "type": "string" } } } } }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "summary": "This API description",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI document", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/v1/types": {
+      "post": {
+        "summary": "Define (or additively redefine) an entity/actor type",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TypeSchema" } } } },
+        "responses": {
+          "204": { "description": "Defined." },
+          "400": { "description": "Invalid or non-additive redefinition.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "get": {
+        "summary": "List all defined type schemas",
+        "responses": {
+          "200": { "description": "Schemas.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TypeSchema" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/columns": {
+      "post": {
+        "summary": "Register a custom audit-log column",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CustomColumnDef" } } } },
+        "responses": {
+          "204": { "description": "Registered." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/logs": {
+      "post": {
+        "summary": "Append an audit event",
+        "description": "Enqueues the event and returns 202 immediately; durability is the pipeline's job (retries + DLQ). Supply an Idempotency-Key header to make retries safe — a repeat of an accepted key returns 202 {\"status\":\"duplicate\"} and is not recorded twice.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "description": "Opaque 1-128 char visible-ASCII string; a UUIDv4 is recommended."
+          }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AppendRequest" } } } },
+        "responses": {
+          "202": {
+            "description": "Queued (or recognised as a duplicate).",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "status": { "type": "string", "enum": ["queued", "duplicate"] } } } } }
+          },
+          "400": { "description": "Malformed event or bad Idempotency-Key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "503": { "description": "Write queue full; retry after backoff.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/logs/query": {
+      "post": {
+        "summary": "Search recorded logs",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LogQuery" } } } },
+        "responses": {
+          "200": { "description": "Matching log views.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/LogView" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "description": "Too many concurrent queries for this token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/logs/export": {
+      "post": {
+        "summary": "Export matching logs as newline-delimited JSON",
+        "description": "Same query and permissions as /v1/logs/query, but the response is application/x-ndjson — one LogView per line — for auditor handoff and SIEM ingestion.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LogQuery" } } } },
+        "responses": {
+          "200": { "description": "One JSON LogView per line.", "content": { "application/x-ndjson": { "schema": { "type": "string" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "description": "Too many concurrent queries for this token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/entities/{type_name}": {
+      "get": {
+        "summary": "Latest version of every entity of a type",
+        "parameters": [
+          { "name": "type_name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "include_deleted", "in": "query", "required": false, "schema": { "type": "boolean", "default": false } }
+        ],
+        "responses": {
+          "200": { "description": "Entity snapshots.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TargetSnapshot" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/entities/{type_name}/{entity_id}/history": {
+      "get": {
+        "summary": "Full version history of one entity (oldest first)",
+        "parameters": [
+          { "name": "type_name", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "entity_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Version snapshots.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/TargetSnapshot" } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/admin/flush": {
+      "post": {
+        "summary": "Flush all queued events to disk",
+        "responses": { "204": { "description": "Flushed." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } }
+      }
+    },
+    "/v1/admin/redrive": {
+      "post": {
+        "summary": "Replay dead-letter-queue events into the store",
+        "responses": {
+          "200": { "description": "Count redriven.", "content": { "application/json": { "schema": { "type": "object", "properties": { "redriven": { "type": "integer" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/admin/retention": {
+      "post": {
+        "summary": "Enforce the retention window now",
+        "responses": {
+          "200": { "description": "Segments dropped.", "content": { "application/json": { "schema": { "type": "object", "properties": { "segments_dropped": { "type": "integer" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/admin/dlq": {
+      "get": {
+        "summary": "Count parked dead-letter-queue events",
+        "responses": {
+          "200": { "description": "Parked count.", "content": { "application/json": { "schema": { "type": "object", "properties": { "parked": { "type": "integer" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/admin/verify": {
+      "post": {
+        "summary": "Verify the store's tamper-evidence hash chains",
+        "description": "A found chain break is a successful verification: 200 with ok:false and the break described. Only 'could not verify at all' is an error status. At most one verification runs at a time.",
+        "responses": {
+          "200": { "description": "Verification report.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/VerifyReport" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "description": "A verification is already running; retry later.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    }
+  }
+}

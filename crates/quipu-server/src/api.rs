@@ -214,8 +214,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/healthz", get(healthz))
         .route("/v1/types", post(define_type).get(list_types))
         .route("/v1/columns", post(define_column))
+        .route("/v1/openapi.json", get(openapi_json))
         .route("/v1/logs", post(append_log))
         .route("/v1/logs/query", post(query_logs))
+        .route("/v1/logs/export", post(export_logs))
         .route("/v1/entities/{type_name}", get(list_entities))
         .route(
             "/v1/entities/{type_name}/{entity_id}/history",
@@ -457,6 +459,56 @@ async fn query_logs(
     let handle = state.handle.clone();
     // the scan runs on the snapshot in the blocking pool; appends keep flowing
     Ok(Json(blocking(move || handle.query(&role, q)).await?))
+}
+
+/// Export matching logs as newline-delimited JSON (`application/x-ndjson`) —
+/// one [`quipu_core::LogView`] per line, the format auditors and SIEM ingest
+/// pipelines expect. Same query body, permission, and per-token slot as
+/// `/v1/logs/query`; the difference is only the response framing. Protected
+/// fields obey the same key boundary as a query: a server without the RSA
+/// private key exports them as ciphertext for the holder to decrypt.
+async fn export_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(q): Json<LogQuery>,
+) -> Result<Response, ApiError> {
+    let caller = state.authorize(&headers, Action::Query)?;
+    let _slot = match state.query_slot(&caller.token_hash) {
+        QuerySlot::Busy => {
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "too many concurrent queries for this token".into(),
+            })
+        }
+        slot => slot,
+    };
+    let role = caller.role;
+    let handle = state.handle.clone();
+    let views = blocking(move || handle.query(&role, q)).await?;
+    // serialize off the snapshot into one line per record; a record that fails
+    // to serialize aborts the export rather than emitting a truncated line
+    let mut body = String::new();
+    for view in &views {
+        let line = serde_json::to_string(view).map_err(|e| internal(e.to_string()))?;
+        body.push_str(&line);
+        body.push('\n');
+    }
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        body,
+    )
+        .into_response())
+}
+
+/// Serve the OpenAPI 3.1 description of this API (the static spec shipped with
+/// the crate). Unauthenticated on purpose — it is an interface description, not
+/// data — and the one endpoint a client developer hits first.
+async fn openapi_json() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        include_str!("../openapi.json"),
+    )
+        .into_response()
 }
 
 // ---- registry browsing -------------------------------------------------------

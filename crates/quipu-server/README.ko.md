@@ -171,14 +171,20 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 429는 그 토큰의 동시 쿼리 상한 도달(돌던 쿼리가 끝나면 재시도하세요),
 503은 큐가 가득 찼다는 뜻(백오프 후 재시도하세요), 그 외는 500입니다.
 
+전체 기계 판독용 계약은 **`GET /v1/openapi.json`**(OpenAPI 3.1, 인증 불필요 — 데이터가 아니라
+인터페이스 설명이므로)으로 서빙됩니다. 코드 제너레이터나 Swagger UI를 여기에 물리세요. 아래 표는
+사람용 요약입니다.
+
 | 메서드 & 경로 | 권한 | 본문 / 응답 |
 |---|---|---|
 | `GET /v1/healthz` | — | `ok` |
+| `GET /v1/openapi.json` | — | 이 API의 OpenAPI 3.1 문서 |
 | `POST /v1/types` | administer | `TypeSchema` JSON → 204. 재정의는 추가만 가능. |
 | `GET /v1/types` | query | `[TypeSchema]` |
 | `POST /v1/columns` | administer | `CustomColumnDef` JSON → 204 |
 | `POST /v1/logs` | emit | 기록 요청 → **202** `{"status":"queued"}` |
 | `POST /v1/logs/query` | query | `LogQuery` JSON → `[LogView]` |
+| `POST /v1/logs/export` | query | `LogQuery` JSON → `application/x-ndjson` (한 줄에 `LogView` 하나) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (최신 버전) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (오래된 것부터) |
 | `POST /v1/admin/flush` | administer | 큐에 쌓인 것 전부 fsync → 204 |
@@ -240,6 +246,23 @@ curl -s -X POST localhost:7700/v1/logs/query \
 `include_past`는 기본이 `true`라서 이름이 바뀐 엔티티도 옛 이름으로 찾을 수 있습니다.
 결과는 `LogView` 행으로,
 로그와 함께 기록 당시 모습 그대로의 actor/target 스냅샷이 담겨 옵니다.
+
+### 익스포트 (감사인 인계, SIEM 적재)
+
+`POST /v1/logs/export`는 `/v1/logs/query`와 **같은 `LogQuery` 본문**을 받지만 응답은
+`application/x-ndjson` — 한 줄에 `LogView` JSON 객체 하나 — 으로, 감사인 인계와 로그 파이프라인이
+대량 처리에 기대하는 포맷입니다:
+
+```sh
+curl -s -X POST localhost:7700/v1/logs/export \
+  -H 'Authorization: Bearer aud1tor-t0ken' -H 'Content-Type: application/json' \
+  -d '{ "from_micros": 1780000000000000 }' > audit-export.ndjson
+```
+
+권한(`query`)과 토큰별 동시성 상한은 쿼리와 같고, 차이는 응답 프레이밍뿐입니다. 필드 보호도 같은 키
+경계를 따릅니다: RSA 개인 키 없는 서버는 보호 필드를 암호문으로 내보내고, 키 보유자가 하류에서
+복호화합니다. 전체 스캔이므로 `from_micros`/`to_micros`로 범위를 잡으세요 — 큰 스토어를 범위 없이
+익스포트하는 것이 가장 묶어둘 가치가 있는 쿼리입니다.
 
 ### 타입 정의
 
@@ -312,12 +335,84 @@ cron을 걸기 전에 알아둘 것 두 가지:
   환경이라면 한가한 시간대에 돌리거나
   검증 중 `POST /v1/logs`가 일부 503을 받을 수 있다고 보면 됩니다.
 
+## 가용성과 복구
+
+데몬은 설계상 단일 프로세스입니다([루트 README의 스코프
+절](../../README.ko.md#가용성과-스코프-의도된-단일-노드) 참고).
+단일 writer라야 스토어를 파일 락 하나, 끊기지 않는 해시 체인 하나로 묶을 수 있습니다.
+그래서 데몬은 가용성의 단일 장애점이 됩니다 — 데몬이 죽으면 호출자의 감사 기록이 멈춥니다 —
+그러므로 이 프로젝트는 체인을 복제하는 대신 가용성을 *클라이언트*에서 해결합니다.
+
+### 멱등 append
+
+`POST /v1/logs`는 `Idempotency-Key` 헤더를 받습니다(1–128자 visible-ASCII 불투명 문자열,
+UUIDv4 형태 권장):
+
+```sh
+curl -s -X POST localhost:7700/v1/logs \
+  -H 'Authorization: Bearer s3rv1ce-a-t0ken' \
+  -H 'Idempotency-Key: 6f1e...c2' \
+  -H 'Content-Type: application/json' -d '{ ... }'
+```
+
+서버는 최근 받은 키를 기억하고(설정 `"idempotency": { "window": 65536 }`,
+메모리에 두며 재시작 시 잊음), 같은 키의 반복 요청에는 두 번째 이벤트를 기록하는 대신
+`202 {"status":"duplicate"}`로 답합니다. 타임아웃은 "큐에 들어감"과 "유실됨"을 구분하지
+못하므로, 이것이 클라이언트가 확인 못 한 요청을 안전하게 재시도하게 해줍니다. 윈도가
+메모리에 있는 것은 의도된 설계입니다: 서버 재시작을 가로지른 재전송은 두 번 기록될 수 있지만,
+두 사본 모두 클라이언트가 찍은 같은 `occurred_at`을 가지므로 사후에 중복임을 알 수 있습니다.
+
+재시작을 가로지른 재시도가 유일한 중복 경로이며, 이 경계는 빈틈이 아니라 의도된 것입니다.
+
+### 콜드 스탠바이 페일오버
+
+장애 났거나 멈춘 노드는 라이브 페일오버가 아니라 콜드 스탠바이로 복구합니다(페일오버 대상이 될
+두 번째 writer가 없습니다 — 그게 단일 체인 설계의 핵심입니다):
+
+1. **액티브 노드를 정지시킵니다.** 아직 살아 있으면 `SIGINT`/`SIGTERM`으로 정상 종료(마지막
+   fsync)하거나, `POST /v1/admin/flush`로 액티브 세그먼트와 레지스트리 꼬리를 디스크에
+   내립니다. 봉인된 세그먼트는 이미 불변이라 언제든 안전하게 복사됩니다. 이 단계는 *액티브*
+   꼬리만 안정시킵니다.
+2. **스토어 루트를 스탠바이 호스트로 복사합니다**(`rsync`, 스냅샷, 백업 복원 — 루트 README의
+   익스포트/백업 노트 참고). 봉인된 세그먼트는 절대 바뀌지 않으므로, 증분 복사는 액티브 꼬리만
+   옮깁니다.
+3. **스탠바이에서 데몬을 띄웁니다**(복사한 루트 대상). open 시 `LOCK` 파일을 잡고, 비정상
+   종료가 남긴 찢어진 꼬리를 잘라낸 뒤(CRC 프레이밍이라 반쯤 쓰인 레코드는 오독되지 않고
+   버려집니다) 다시 쓰기 가능해집니다.
+4. **클라이언트를 스탠바이로 돌립니다**(DNS/로드밸런서). `quipu-client`를 쓰는 클라이언트는 그
+   공백 동안 이벤트를 로컬 스풀에 들고 있다가 다음 `drain_spool`에 재생합니다. 멱등 키 덕에 옛
+   노드가 이미 받은 것을 재생해도 no-op이 됩니다.
+
+재시작 시간은 스토어 전체가 아니라 **액티브** 세그먼트 크기 + 레지스트리 재생에 비례합니다.
+봉인된 세그먼트는 open 때 다시 스캔되지 않습니다. `max_segment_bytes`를 적당히 작게 두면 그
+꼬리 — 따라서 페일오버 — 가 빨라집니다.
+
+### SIEM 포워딩
+
+`sink` 섹션을 추가하면 디스크에 안전하게 적힌 이벤트를 syslog 수집기(RFC 5424/UDP)로 미러링합니다:
+
+```json
+"sink": { "syslog_udp": "10.0.0.5:514", "app_name": "quipu-server", "queue_capacity": 16384 }
+```
+
+받아들인 이벤트마다 syslog 한 줄이 되고, 메시지는 컴팩트한 JSON 요약입니다 — log id, actor,
+method, url, target id, 커스텀 컬럼 키. 이벤트 **`content`는 포워딩하지 않습니다**: 크거나 보호
+값을 담을 수 있고, 스토어가 시스템 오브 레코드이기 때문입니다. SIEM은 감사 추적의 골격만 받습니다.
+미러는 **베스트에포트이며 절대 쓰기를 막지 않습니다**: 전용 스레드가 소켓을 소유하고, writer
+스레드는 논블로킹 enqueue만 하며, 백로그가 가득 차면 영속화를 멈추는 대신 줄을 버립니다(카운트하고
+드물게 로깅). 성공 시에만 발동하고 — DLQ에 박힌 이벤트는 미러링되지 않습니다.
+
+syslog가 데몬이 기본 제공하는 유일한 sink입니다(추가 의존성 없음). webhook/Kafka/기타 sink는 같은
+모양 — `quipu_middleware::SinkFn` 클로저 — 이라 파이프라인을 직접 굴리는 임베디드 사용자가 끼울 수
+있습니다.
+
 ## v1에서 의도적으로 둔 제약
 
 - 스토어도 하나, 테넌트도 하나입니다.
   토큰이 가르는 것은 할 수 있는 일(emit/query/admin)이지 볼 수 있는 데이터가 아니라서,
   모든 reader가 모든 로그를 봅니다.
   테넌트 격리는 테넌트마다 스토어 루트를 따로 두는 일이라 다음 과제로 남겨뒀습니다.
-- Rust 클라이언트 crate는 아직 없습니다.
-  다만 위 API는 어떤 HTTP 클라이언트로도 부를 수 있을 만큼 작습니다.
+- 레퍼런스 클라이언트([`quipu-client`](../quipu-client/README.ko.md))는 재전송/스풀 프로토콜만
+  담고 전송 계층은 담지 않습니다.
+  위 API는 어떤 HTTP 클라이언트로도 부를 수 있을 만큼 작습니다.
   gRPC가 아니라 JSON을 고른 이유이기도 합니다.

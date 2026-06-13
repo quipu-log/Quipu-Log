@@ -23,6 +23,22 @@ pub struct ServerConfig {
     /// Idempotency-key duplicate detection on `POST /v1/logs`. Omit for the
     /// default window size.
     pub idempotency: Option<IdempotencySection>,
+    /// Mirror durably-written events to a syslog collector (SIEM forwarding).
+    /// Omit to forward nothing.
+    pub sink: Option<SinkSection>,
+}
+
+/// SIEM forwarding over syslog/UDP (RFC 5424). Best-effort: a backlog drops
+/// lines rather than back-pressuring audit writes — see [`crate::sink`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkSection {
+    /// Collector address, `host:port` (e.g. `10.0.0.5:514`).
+    pub syslog_udp: String,
+    /// RFC 5424 APP-NAME tag; defaults to `quipu-server`.
+    pub app_name: Option<String>,
+    /// In-flight backlog bound before lines are dropped; defaults to 16384.
+    pub queue_capacity: Option<usize>,
 }
 
 /// Duplicate detection for client retransmissions (`Idempotency-Key`).

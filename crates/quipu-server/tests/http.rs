@@ -332,6 +332,69 @@ async fn idempotency_key_dedupes_retransmissions() {
 }
 
 #[tokio::test]
+async fn export_returns_ndjson_one_line_per_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+    send(&app, "POST", "/v1/types", Some("admin-token"), Some(user_schema())).await;
+    for url in ["/api/a", "/api/b"] {
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/logs",
+            Some("writer-token"),
+            Some(append_body("alice", url)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+
+    // export is query-gated and returns x-ndjson: one JSON object per line
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/export",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let text = body.as_str().expect("ndjson body is text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "two records, two lines: {text:?}");
+    for line in lines {
+        let v: Value = serde_json::from_str(line).expect("each line is valid JSON");
+        assert_eq!(v["actor"]["entity_id"], "alice");
+    }
+
+    // a writer (emit-only) cannot export
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/logs/export",
+        Some("writer-token"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    pipeline.shutdown();
+}
+
+#[tokio::test]
+async fn openapi_is_served_unauthenticated_and_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+    // no token required — it is an interface description, not data
+    let (status, body) = send(&app, "GET", "/v1/openapi.json", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"], "3.1.0");
+    assert!(body["paths"]["/v1/logs/export"].is_object());
+    assert!(body["paths"]["/v1/logs"]["post"].is_object());
+    pipeline.shutdown();
+}
+
+#[tokio::test]
 async fn auth_and_permission_errors() {
     let dir = tempfile::tempdir().unwrap();
     let (app, pipeline) = test_app(dir.path());

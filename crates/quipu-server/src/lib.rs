@@ -15,6 +15,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod serve;
+pub mod sink;
 
 pub use api::{
     router, spawn_periodic_verify, AppState, QuerySlot, VerifyGuard, DEFAULT_IDEMPOTENCY_WINDOW,
@@ -23,3 +24,4 @@ pub use api::{
 pub use auth::{sha256_hex, AuthState, TokenMap};
 pub use config::ServerConfig;
 pub use serve::{bind, serve};
+pub use sink::SyslogSink;

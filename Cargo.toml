@@ -4,14 +4,23 @@ members = [
     "crates/quipu-core",
     "crates/quipu-middleware",
     "crates/quipu-server",
+    "crates/quipu-client",
+    "crates/quipu-mcp",
     "examples/axum-demo",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# MSRV floor: the store guards its root with `std::fs::File::try_lock` and
+# matches on `std::fs::TryLockError`, both stabilized in Rust 1.89. Raising this
+# is a breaking change for downstreams — see CHANGELOG.md's compatibility policy.
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/draft-dhgo/Quipu-Log"
+homepage = "https://github.com/draft-dhgo/Quipu-Log"
+keywords = ["audit", "audit-log", "tamper-evident", "compliance", "logging"]
+categories = ["database-implementations", "cryptography", "web-programming"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

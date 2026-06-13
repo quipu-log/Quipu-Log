@@ -72,6 +72,42 @@ fn emits_asynchronously_and_queries_back() {
 }
 
 #[test]
+fn sink_fires_on_durable_write_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let sunk = Arc::new(AtomicUsize::new(0));
+    let sunk_for_hook = sunk.clone();
+    let sink: SinkFn = Arc::new(move |_event, _log_id| {
+        sunk_for_hook.fetch_add(1, Ordering::SeqCst);
+    });
+    let pipeline = AuditPipeline::start(
+        store_at(dir.path()),
+        dir.path().to_path_buf(),
+        PermissionPolicy::deny_by_default().grant(Role::new("svc"), &[Action::Emit]),
+        PipelineConfig {
+            sink: Some(sink),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let handle = pipeline.handle();
+    let svc = Role::new("svc");
+
+    for i in 0..5 {
+        handle.emit(&svc, event(&format!("/api/{i}"))).unwrap();
+    }
+    // an event for an undefined type fails to persist -> DLQ, never the sink
+    let mut bad = event("/api/bad");
+    bad.actor_type = "no_such_type".into();
+    handle.emit(&svc, bad).unwrap();
+    handle.flush().unwrap();
+
+    pipeline.shutdown();
+    // exactly the five durable writes reached the sink; the parked one did not
+    assert_eq!(sunk.load(Ordering::SeqCst), 5);
+}
+
+#[test]
 fn failed_events_park_in_dlq_then_redrive() {
     let dir = tempfile::tempdir().unwrap();
     let fallback_hits = Arc::new(AtomicUsize::new(0));

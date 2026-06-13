@@ -163,14 +163,20 @@ Errors are `{"error": "<message>"}` with 401 (missing/unknown/expired token),
 429 (token at its concurrent-query cap — retry when a query finishes),
 503 (append queue full — back off and retry), or 500.
 
+The full machine-readable contract is served at **`GET /v1/openapi.json`**
+(OpenAPI 3.1, unauthenticated — it is an interface description, not data). Point
+a code generator or Swagger UI at it; the table below is the human summary.
+
 | method & path | action | body / response |
 |---|---|---|
 | `GET /v1/healthz` | — | `ok` |
+| `GET /v1/openapi.json` | — | this API's OpenAPI 3.1 document |
 | `POST /v1/types` | administer | `TypeSchema` JSON → 204. Additive redefinition only. |
 | `GET /v1/types` | query | `[TypeSchema]` |
 | `POST /v1/columns` | administer | `CustomColumnDef` JSON → 204 |
 | `POST /v1/logs` | emit | append request → **202** `{"status":"queued"}` |
 | `POST /v1/logs/query` | query | `LogQuery` JSON → `[LogView]` |
+| `POST /v1/logs/export` | query | `LogQuery` JSON → `application/x-ndjson` (one `LogView` per line) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (latest versions) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (oldest first) |
 | `POST /v1/admin/flush` | administer | fsync everything queued → 204 |
@@ -228,6 +234,25 @@ All set conditions are AND-ed; everything is optional (`{}` returns everything u
 `mode` is `"exact"` (default), `"exact_ci"`, `"prefix"`, or `"contains"`;
 `include_past` defaults to `true` (a renamed entity is still found by its old name).
 Hits are `LogView` rows: the log plus actor/target snapshots exactly as recorded.
+
+### Exporting (auditor handoff, SIEM ingest)
+
+`POST /v1/logs/export` takes the **same `LogQuery` body** as `/v1/logs/query`
+but answers with `application/x-ndjson` — one `LogView` JSON object per line —
+the format auditors and log pipelines expect for bulk handoff:
+
+```sh
+curl -s -X POST localhost:7700/v1/logs/export \
+  -H 'Authorization: Bearer aud1tor-t0ken' -H 'Content-Type: application/json' \
+  -d '{ "from_micros": 1780000000000000 }' > audit-export.ndjson
+```
+
+Same permission (`query`) and per-token concurrency cap as a query; the only
+difference is the response framing. Field protection obeys the same key
+boundary: a server without the RSA private key exports protected fields as
+ciphertext for the key-holder to decrypt downstream. Scope the dump with
+`from_micros`/`to_micros` — it is a full scan, so an unbounded export of a large
+store is the one query most worth bounding.
 
 ### Defining a type
 
@@ -295,12 +320,86 @@ Two things to know before pointing a cron at it:
   typical stores, but on a very large store under heavy write load, schedule
   it off-peak or expect some 503s on `POST /v1/logs` during the pass.
 
+## Availability and recovery
+
+The daemon is a single process by design (see the
+[root README's scope section](../../README.md#availability-and-scope-a-single-node-on-purpose)):
+one writer is what keeps the store to one file lock and one unbroken hash chain.
+That makes the daemon a single point of availability — while it is down, callers' audit trails stall —
+so the project solves availability at the *client*, not by replicating the chain.
+
+### Idempotent appends
+
+`POST /v1/logs` accepts an `Idempotency-Key` header (any opaque 1–128 char visible-ASCII
+string; a UUIDv4 is the recommended shape):
+
+```sh
+curl -s -X POST localhost:7700/v1/logs \
+  -H 'Authorization: Bearer s3rv1ce-a-t0ken' \
+  -H 'Idempotency-Key: 6f1e...c2' \
+  -H 'Content-Type: application/json' -d '{ ... }'
+```
+
+The server remembers recently accepted keys (config `"idempotency": { "window": 65536 }`;
+in memory, forgotten on restart) and answers a repeat with `202 {"status":"duplicate"}` instead of
+recording a second event. This is what makes a client safe to retry a request it could not
+confirm — a timeout cannot tell "queued" from "lost". The window is in memory by design: a
+retransmission that straddles a server restart can record twice, but both copies carry the same
+client-set `occurred_at`, so the duplicate is detectable after the fact.
+
+A retry that straddles a restart is the only duplicate path; the bound is deliberate, not a gap.
+
+### Cold-standby failover
+
+Recover from a failed or stopped node by cold standby, not live failover (there is no second
+writer to fail over *to* — that is the point of the single-chain design):
+
+1. **Quiesce the active node** if it is still up: send `SIGINT`/`SIGTERM` for a clean shutdown
+   (final fsync), or call `POST /v1/admin/flush` to push the active segment and registry tail to
+   disk. Sealed segments are already immutable and safe to copy at any time; this step only settles
+   the *active* tail.
+2. **Copy the store root** to the standby host (`rsync`, snapshot, restore from backup — see the
+   root README's export/backup notes). Because sealed segments never change, an incremental copy
+   only moves the active tail.
+3. **Start the daemon on the standby** against the copied root. On open it takes the `LOCK` file,
+   truncates any torn tail left by an unclean stop (CRC-framed, so a half-written record is dropped,
+   never misread), and is writable again.
+4. **Repoint clients** (DNS/load-balancer) at the standby. Clients running `quipu-client` held
+   their events in the local spool through the gap and replay them on the next `drain_spool`; the
+   idempotency keys make a replay of anything the old node already accepted a no-op.
+
+Restart time is bounded by the size of the **active** segment plus the registry replay, not the
+whole store: sealed segments are never rescanned on open. Keeping `max_segment_bytes` modest keeps
+that tail — and therefore failover — fast.
+
+### SIEM forwarding
+
+Mirror every durably-written event to a syslog collector (RFC 5424 over UDP) by adding a `sink`
+section:
+
+```json
+"sink": { "syslog_udp": "10.0.0.5:514", "app_name": "quipu-server", "queue_capacity": 16384 }
+```
+
+Each accepted event becomes one syslog line whose message is a compact JSON summary —
+log id, actor, method, url, target ids, custom-column keys. The event **`content` is not
+forwarded**: it can be large or hold protected values, and the store is the system of record;
+the SIEM gets the audit-trail skeleton. The mirror is **best-effort and never back-pressures
+writes**: a dedicated thread owns the socket, the writer thread only does a non-blocking enqueue,
+and a full backlog drops lines (counted, logged sparsely) rather than stalling persistence. It
+fires on success only — a DLQ-parked event is not mirrored.
+
+Syslog is the one sink the daemon ships (no extra dependency). A webhook/Kafka/other sink is the
+same shape — a `quipu_middleware::SinkFn` closure — for embedded users who run the pipeline
+directly.
+
 ## Limits (v1, by design)
 
 - One store, one tenant:
   tokens separate *capabilities* (emit/query/admin), not data —
   every reader sees every log.
   Per-tenant isolation would mean per-tenant store roots and is future work.
-- No Rust client crate yet;
-  the API above is small enough to call with any HTTP client,
+- The reference client ([`quipu-client`](../quipu-client/README.md)) carries the
+  retransmission/spool protocol but no transport;
+  the API is small enough to call from any HTTP client,
   which is the point of choosing JSON over gRPC.

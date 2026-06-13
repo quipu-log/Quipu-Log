@@ -5,10 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-quipu-core = { path = "../quipu-core" }
-quipu-middleware = { path = "../quipu-middleware" }
+quipu-core = { path = "../quipu-core", version = "0.1.0" }
+quipu-middleware = { path = "../quipu-middleware", version = "0.1.0" }
 axum = { workspace = true }
 axum-server = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal"] }
