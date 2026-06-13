@@ -5,7 +5,8 @@ use crate::permissions::{Action, PermissionPolicy, Role};
 use quipu_core::storage::{SegmentReader, SegmentSlice, Table, TableScan};
 use quipu_core::{
     summarize_access_query, summarize_log_query, AccessQuery, AccessRecord, AuditLog, AuditStore,
-    CustomColumnDef, LogQuery, LogView, QueryPage, ReadSnapshot, TargetSnapshot, TypeSchema, Uid,
+    Checkpoint, CustomColumnDef, LogQuery, LogView, QueryPage, ReadSnapshot, TargetSnapshot,
+    TypeSchema, Uid,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -184,6 +185,11 @@ enum Command {
     ApplyRetention(SyncSender<Result<usize, MiddlewareError>>),
     DlqLen(SyncSender<Result<usize, MiddlewareError>>),
     VerifyIntegrity(SyncSender<Result<VerifyReport, MiddlewareError>>),
+    /// Force a signed checkpoint of the current chain head, then hand back the
+    /// latest checkpoint on file (`None` when the store holds no signing key
+    /// and has never checkpointed). Used to pin a shard's head for cross-shard
+    /// anchoring ([`crate::ShardRouter::global_checkpoint`]).
+    Checkpoint(SyncSender<Result<Option<Checkpoint>, MiddlewareError>>),
     /// Fire-and-forget meta-audit append (no-op when the store's access log
     /// is disabled). A plain append — it can never produce another access
     /// record, which is what makes self-reference loops impossible.
@@ -510,6 +516,16 @@ impl AuditHandle {
             Some(report.segments_checked as u64),
         ));
         Ok(report)
+    }
+
+    /// Force a checkpoint of the chain's current head and return the latest
+    /// checkpoint on file (permission-gated, [`Action::Administer`]). Returns
+    /// `Ok(None)` for a write-only store that holds no signing key and has
+    /// never checkpointed. The pin used by cross-shard anchoring
+    /// ([`crate::ShardRouter::global_checkpoint`]).
+    pub fn checkpoint(&self, role: &Role) -> Result<Option<Checkpoint>, MiddlewareError> {
+        self.check(role, Action::Administer)?;
+        self.round_trip(Command::Checkpoint)
     }
 }
 
@@ -861,6 +877,16 @@ impl Worker {
             }
             Command::VerifyIntegrity(reply) => {
                 let _ = reply.send(Ok(self.verify()));
+            }
+            Command::Checkpoint(reply) => {
+                let res = (|| {
+                    // force a checkpoint pinning the current head (no-op without
+                    // a signing key), then hand back the latest on file
+                    self.store.checkpoint().map_err(MiddlewareError::Core)?;
+                    let cps = self.store.checkpoints().map_err(MiddlewareError::Core)?;
+                    Ok(cps.into_iter().next_back())
+                })();
+                let _ = reply.send(res);
             }
             Command::RecordAccess(rec) => {
                 // fail-open: dropping a meta-audit record must not stall the

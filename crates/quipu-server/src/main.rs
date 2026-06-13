@@ -1,6 +1,111 @@
 use quipu_core::AuditStore;
-use quipu_middleware::{AuditPipeline, PermissionPolicy};
+use quipu_middleware::{
+    AuditPipeline, PermissionPolicy, PipelineConfig, ShardId, ShardMap, ShardRouter,
+};
 use quipu_server::{router, AppState, ServerConfig, SyslogSink};
+use std::sync::Arc;
+
+/// The opened store, either a single embedded store or N sharded ones behind a
+/// router. Held by `main` for the process lifetime so shutdown can flush it.
+enum Backend {
+    Single(AuditPipeline),
+    Sharded(Arc<ShardRouter>),
+}
+
+/// Open the store(s) and start the writer thread(s) per the config: one store
+/// under `store.root` (single mode), or N under `store.root/shard-NNNN` when a
+/// `[shards]` section is present. The same `pipeline_cfg` (incl. the SIEM sink)
+/// is shared by every shard's writer.
+fn build_backend(
+    cfg: &ServerConfig,
+    base_root: &std::path::Path,
+    pipeline_cfg: PipelineConfig,
+) -> Backend {
+    let Some(shards) = &cfg.shards else {
+        // single-store mode: byte-compatible with an unsharded deployment
+        let store_cfg = cfg.store_config().unwrap_or_else(|e| {
+            eprintln!("invalid store/keys config: {e}");
+            std::process::exit(1);
+        });
+        let store = AuditStore::open(store_cfg).unwrap_or_else(|e| {
+            eprintln!("failed to open store at '{}': {e}", base_root.display());
+            std::process::exit(1);
+        });
+        let pipeline = AuditPipeline::start(
+            store,
+            base_root.to_path_buf(),
+            PermissionPolicy::allow_all(),
+            pipeline_cfg,
+            None,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("failed to start audit pipeline: {e}");
+            std::process::exit(1);
+        });
+        return Backend::Single(pipeline);
+    };
+
+    if shards.count == 0 {
+        eprintln!("invalid [shards] config: count must be at least 1");
+        std::process::exit(1);
+    }
+    if let Some(bad) = shards.frozen.iter().find(|f| **f >= shards.count) {
+        eprintln!(
+            "invalid [shards] config: frozen id {bad} is >= count {}",
+            shards.count
+        );
+        std::process::exit(1);
+    }
+    let active: Vec<ShardId> = (0..shards.count)
+        .filter(|i| !shards.frozen.contains(i))
+        .map(ShardId)
+        .collect();
+    if active.is_empty() {
+        eprintln!(
+            "invalid [shards] config: every shard is frozen — writes would have nowhere to go"
+        );
+        std::process::exit(1);
+    }
+    let frozen: Vec<ShardId> = shards.frozen.iter().copied().map(ShardId).collect();
+    let map = ShardMap::from_parts(active, frozen, shards.hash_seed);
+
+    let mut pipelines = Vec::with_capacity(shards.count as usize);
+    for id in 0..shards.count {
+        let shard = ShardId(id);
+        let root = base_root.join(shard.dir_name());
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            eprintln!("failed to create shard dir '{}': {e}", root.display());
+            std::process::exit(1);
+        }
+        let store_cfg = cfg.store_config_at(root.clone()).unwrap_or_else(|e| {
+            eprintln!("invalid store/keys config for {shard}: {e}");
+            std::process::exit(1);
+        });
+        let store = AuditStore::open(store_cfg).unwrap_or_else(|e| {
+            eprintln!("failed to open {shard} store at '{}': {e}", root.display());
+            std::process::exit(1);
+        });
+        let pipeline = AuditPipeline::start(
+            store,
+            root,
+            PermissionPolicy::allow_all(),
+            pipeline_cfg.clone(),
+            None,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("failed to start {shard} pipeline: {e}");
+            std::process::exit(1);
+        });
+        pipelines.push((shard, pipeline));
+    }
+    tracing::info!(
+        shards = shards.count,
+        frozen = shards.frozen.len(),
+        "sharded mode: {} active shard writer(s)",
+        shards.count as usize - shards.frozen.len()
+    );
+    Backend::Sharded(Arc::new(ShardRouter::new(map, pipelines)))
+}
 
 fn usage() -> ! {
     eprintln!("usage: quipu-server <config.json>          serve");
@@ -57,7 +162,11 @@ fn run_rekey(config_path: &str) -> ! {
          version {} ({})",
         event.rsa_version,
         event.hmac_version,
-        if event.hmac_version == 0 { "none configured" } else { "active" },
+        if event.hmac_version == 0 {
+            "none configured"
+        } else {
+            "active"
+        },
     );
     for t in &event.tables {
         println!(
@@ -68,7 +177,10 @@ fn run_rekey(config_path: &str) -> ! {
             &t.new_chain_head[..12.min(t.new_chain_head.len())],
         );
     }
-    println!("signed re-key event recorded (signing key version {}); integrity verified", event.signing_key_version);
+    println!(
+        "signed re-key event recorded (signing key version {}); integrity verified",
+        event.signing_key_version
+    );
     std::process::exit(0);
 }
 
@@ -88,21 +200,7 @@ async fn main() {
     };
     let cfg = load_config(&config_path);
 
-    let store_cfg = match cfg.store_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("invalid store/keys config: {e}");
-            std::process::exit(1);
-        }
-    };
-    let store_root = store_cfg.root.clone();
-    let store = match AuditStore::open(store_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to open store at '{}': {e}", store_root.display());
-            std::process::exit(1);
-        }
-    };
+    let store_root = cfg.store.root.clone();
 
     // SIEM forwarding (opt-in `sink` section): each durably-written event is
     // mirrored to syslog. Hold the handle for the process lifetime so its
@@ -127,23 +225,11 @@ async fn main() {
         None => None,
     };
 
-    // the pipeline is only reachable through the HTTP handlers here, and
+    // the pipeline(s) are only reachable through the HTTP handlers here, and
     // those gate every call against the hot-reloadable AppState policy — so
     // the pipeline's own (start-time-frozen) policy must not also enforce,
     // or a SIGHUP grant change could never take effect
-    let pipeline = match AuditPipeline::start(
-        store,
-        store_root.clone(),
-        PermissionPolicy::allow_all(),
-        pipeline_cfg,
-        None,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("failed to start audit pipeline: {e}");
-            std::process::exit(1);
-        }
-    };
+    let backend = build_backend(&cfg, &store_root, pipeline_cfg);
 
     let auth_state = match cfg.auth_state() {
         Ok(a) => a,
@@ -152,7 +238,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut state = AppState::new(pipeline.handle(), auth_state, store_root);
+    let mut state = match &backend {
+        Backend::Single(p) => AppState::new(p.handle(), auth_state, store_root),
+        Backend::Sharded(r) => {
+            let header = cfg
+                .shards
+                .as_ref()
+                .and_then(|s| s.tenant_header.clone())
+                .unwrap_or_else(|| quipu_server::DEFAULT_TENANT_HEADER.to_string());
+            AppState::new_sharded(r.clone(), auth_state, store_root, header)
+        }
+    };
     if let Some(idem) = &cfg.idempotency {
         state = state.idempotency_window(idem.window);
     }
@@ -215,5 +311,17 @@ async fn main() {
 
     // flush everything queued before the process exits — audit data must not
     // ride on the OS cache through a shutdown
-    pipeline.shutdown();
+    match backend {
+        Backend::Single(p) => p.shutdown(),
+        // serve() has returned, so no new emits; flush every shard durably.
+        // A clean writer-thread join needs sole ownership of the router, which
+        // the long-lived SIGHUP/verify tasks may still share — fall back to a
+        // flush (which fsyncs each shard) when they do.
+        Backend::Sharded(r) => match Arc::try_unwrap(r) {
+            Ok(router) => router.shutdown(),
+            Err(shared) => {
+                let _ = shared.flush();
+            }
+        },
+    }
 }
