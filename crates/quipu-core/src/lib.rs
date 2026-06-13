@@ -12,6 +12,7 @@
 //! The async event pipeline, filters, DLQ and HTTP proxy live in `quipu-middleware`;
 //! this crate is the synchronous storage and query core underneath it.
 
+pub mod access;
 pub mod checkpoint;
 pub mod crypto;
 pub mod error;
@@ -26,6 +27,10 @@ pub mod store;
 pub mod time;
 mod tokens;
 
+pub use access::{
+    summarize_access_query, summarize_log_query, AccessQuery, AccessRecord, ACCESS_TYPE,
+    RESERVED_TYPE_PREFIX,
+};
 pub use checkpoint::Checkpoint;
 pub use crypto::KeyRing;
 pub use error::{Error, Result};
