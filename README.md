@@ -9,8 +9,6 @@ English | [한국어](README.ko.md)
 
 **Tamper-evident audit logging for Rust services. Runs in your process — no database to set up.**
 
-> **Pre-1.0.** The on-disk format is still settling and APIs can shift within 0.x ([compatibility policy](CHANGELOG.md#compatibility-policy)). Not on crates.io yet — depend on it by git.
-
 Quipu-Log answers questions like: *who changed this document last quarter, and what was it called back then?*
 
 It logs who did what, to which entity, through which API. Each record is hash-chained to the one before it, so a silent edit shows up. And it stores what every entity looked like the moment you wrote the log. Rename a user today, and last month's logs still show — and still find — the old name.
