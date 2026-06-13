@@ -40,6 +40,10 @@ change and gets a major-version bump with a changelog note.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-14
+
+Initial public release — all five crates published to crates.io.
+
 ### Added
 - `quipu-mcp`: Model Context Protocol server exposing the audit store to an LLM
   agent — `query_logs`, `get_entity_history`, `verify_store_integrity` tools
@@ -64,11 +68,11 @@ change and gets a major-version bump with a changelog note.
 - `quipu-server`: integrity verification endpoint (`POST /v1/admin/verify`) and
   optional periodic background verification.
 - `quipu-core`: signed integrity checkpoints with an external-anchor hook.
+- `quipu-middleware` + `quipu-server`: horizontal scaling — `ShardRouter` /
+  `ShardMap` route writes by tenant across N independent single-writer chains,
+  with timestamp-merged read fan-out and add-only resharding (freeze existing
+  shards, route new writes to new ones); cross-shard `GlobalCheckpoint`
+  anchoring (`verify_global`); server `[shards]` config with `X-Quipu-Tenant`
+  routing. Single-store mode stays byte- and wire-compatible.
 - crates.io publishing metadata across the workspace: MSRV, keywords,
   categories, `docs.rs` config, and this changelog.
-
-## [0.1.0]
-
-Initial workspace: `quipu-core` (embedded storage engine), `quipu-middleware`
-(async pipeline, DLQ, filters, permissions, tower layer), `quipu-server`
-(standalone HTTP daemon).
