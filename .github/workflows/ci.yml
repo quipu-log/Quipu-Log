@@ -68,5 +68,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run segment_reader -- -max_total_time=45 -rss_limit_mb=4096
-      - run: cargo fuzz run dlq_redrive -- -max_total_time=45 -rss_limit_mb=4096
+      # pin the gnu target: cargo-fuzz otherwise defaults to musl on the runner,
+      # whose static libc is incompatible with the AddressSanitizer build.
+      - run: cargo fuzz run segment_reader --target x86_64-unknown-linux-gnu -- -max_total_time=45 -rss_limit_mb=4096
+      - run: cargo fuzz run dlq_redrive --target x86_64-unknown-linux-gnu -- -max_total_time=45 -rss_limit_mb=4096
