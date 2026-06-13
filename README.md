@@ -50,6 +50,10 @@ Your code holds a cheap, cloneable **handle** to the pipeline. A dedicated write
 
 ## Quick start
 
+```sh
+cargo add quipu-core quipu-middleware
+```
+
 ```rust
 use quipu_core::*;
 use quipu_middleware::*;
