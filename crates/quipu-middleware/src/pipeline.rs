@@ -2,8 +2,8 @@ use crate::event::AuditEvent;
 use crate::permissions::{Action, PermissionPolicy, Role};
 use quipu_core::storage::{SegmentSlice, Table, TableScan};
 use quipu_core::{
-    AuditLog, AuditStore, CustomColumnDef, LogQuery, LogView, ReadSnapshot, TargetSnapshot,
-    TypeSchema, Uid,
+    summarize_access_query, summarize_log_query, AccessQuery, AccessRecord, AuditLog, AuditStore,
+    CustomColumnDef, LogQuery, LogView, ReadSnapshot, TargetSnapshot, TypeSchema, Uid,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -122,6 +122,18 @@ enum Command {
     ApplyRetention(SyncSender<Result<usize, MiddlewareError>>),
     DlqLen(SyncSender<Result<usize, MiddlewareError>>),
     VerifyIntegrity(SyncSender<Result<VerifyReport, MiddlewareError>>),
+    /// Fire-and-forget meta-audit append (no-op when the store's access log
+    /// is disabled). A plain append — it can never produce another access
+    /// record, which is what makes self-reference loops impossible.
+    RecordAccess(Box<AccessRecord>),
+    /// Read the access log back. The worker records this read itself (one
+    /// `query_access` record per call) *after* computing the result, directly
+    /// on the store — not via another command — so it cannot recurse.
+    QueryAccess {
+        actor: String,
+        q: AccessQuery,
+        reply: SyncSender<Result<Vec<AccessRecord>, MiddlewareError>>,
+    },
 }
 
 /// Cloneable, thread-safe handle the host application talks to. `emit` never
@@ -183,10 +195,55 @@ impl AuditHandle {
     /// Query recorded logs (permission-gated). The scan runs on the *calling*
     /// thread against a read snapshot — the writer thread keeps persisting
     /// events meanwhile. In async code wrap it in `spawn_blocking`.
+    ///
+    /// When the store's access log is enabled the query is meta-audited (one
+    /// `query_logs` record: the role as actor, a value-free parameter
+    /// summary, the hit count). Recording is fail-open: a full queue or a
+    /// stopped worker logs a warning instead of failing the query — see
+    /// [`record_access`](Self::record_access).
     pub fn query(&self, role: &Role, q: LogQuery) -> Result<Vec<LogView>, MiddlewareError> {
-        self.snapshot(role)?
+        let hits = self
+            .snapshot(role)?
             .query(&q)
-            .map_err(MiddlewareError::Core)
+            .map_err(MiddlewareError::Core)?;
+        self.record_access(AccessRecord::new(
+            &role.0,
+            "query_logs",
+            summarize_log_query(&q),
+            Some(hits.len() as u64),
+        ));
+        Ok(hits)
+    }
+
+    /// Append a meta-audit record (no-op when the store's access log is
+    /// disabled). Fire-and-forget and **fail-open**: if the queue is full or
+    /// the worker is gone, the record is dropped with a `warn` log rather
+    /// than failing the operation it describes — the primary audit path and
+    /// read availability outrank the meta-audit trail, and the same backlog
+    /// would be failing primary `emit`s anyway (which is the loud signal).
+    pub fn record_access(&self, rec: AccessRecord) {
+        if let Err(e) = self.tx.try_send(Command::RecordAccess(Box::new(rec))) {
+            let reason = match e {
+                TrySendError::Full(_) => "queue full",
+                TrySendError::Disconnected(_) => "worker gone",
+            };
+            tracing::warn!(reason, "meta-audit access record dropped");
+        }
+    }
+
+    /// Read the meta-audit access log (permission-gated,
+    /// [`Action::Administer`] — access records reveal who searched what, so
+    /// they are admin material). This read is itself recorded as one
+    /// `query_access` access record; the recording is an append and never
+    /// recurses, so repeated reads grow the log by exactly one record each.
+    pub fn query_access(
+        &self,
+        role: &Role,
+        q: AccessQuery,
+    ) -> Result<Vec<AccessRecord>, MiddlewareError> {
+        self.check(role, Action::Administer)?;
+        let actor = role.0.clone();
+        self.round_trip(|reply| Command::QueryAccess { actor, q, reply })
     }
 
     /// Schemas of all defined entity/actor types (permission-gated).
@@ -204,11 +261,19 @@ impl AuditHandle {
     ) -> Result<Vec<TargetSnapshot>, MiddlewareError> {
         self.check(role, Action::Query)?;
         let type_name = type_name.into();
-        self.round_trip(|reply| Command::ListEntities {
-            type_name,
+        let snaps = self.round_trip(|reply| Command::ListEntities {
+            type_name: type_name.clone(),
             include_deleted,
             reply,
-        })
+        })?;
+        self.record_access(AccessRecord::new(
+            &role.0,
+            "list_entities",
+            serde_json::json!({ "type_name": type_name, "include_deleted": include_deleted })
+                .to_string(),
+            Some(snaps.len() as u64),
+        ));
+        Ok(snaps)
     }
 
     /// Full version history of one entity, oldest first (permission-gated).
@@ -220,11 +285,18 @@ impl AuditHandle {
     ) -> Result<Vec<TargetSnapshot>, MiddlewareError> {
         self.check(role, Action::Query)?;
         let (type_name, entity_id) = (type_name.into(), entity_id.into());
-        self.round_trip(|reply| Command::EntityHistory {
-            type_name,
-            entity_id,
+        let snaps = self.round_trip(|reply| Command::EntityHistory {
+            type_name: type_name.clone(),
+            entity_id: entity_id.clone(),
             reply,
-        })
+        })?;
+        self.record_access(AccessRecord::new(
+            &role.0,
+            "entity_history",
+            serde_json::json!({ "type_name": type_name, "entity_id": entity_id }).to_string(),
+            Some(snaps.len() as u64),
+        ));
+        Ok(snaps)
     }
 
     /// Create (or additively redefine) the registry table for an entity/actor
@@ -255,18 +327,34 @@ impl AuditHandle {
     /// Replay parked DLQ events into the store. Returns how many succeeded.
     pub fn redrive_dlq(&self, role: &Role) -> Result<usize, MiddlewareError> {
         self.check(role, Action::Administer)?;
-        self.round_trip(Command::RedriveDlq)
+        let n = self.round_trip(Command::RedriveDlq)?;
+        self.record_access(AccessRecord::new(
+            &role.0,
+            "redrive_dlq",
+            "{}",
+            Some(n as u64),
+        ));
+        Ok(n)
     }
 
     /// Enforce the retention window now. Returns segments dropped.
     pub fn apply_retention(&self, role: &Role) -> Result<usize, MiddlewareError> {
         self.check(role, Action::Administer)?;
-        self.round_trip(Command::ApplyRetention)
+        let n = self.round_trip(Command::ApplyRetention)?;
+        self.record_access(AccessRecord::new(
+            &role.0,
+            "apply_retention",
+            "{}",
+            Some(n as u64),
+        ));
+        Ok(n)
     }
 
     pub fn dlq_len(&self, role: &Role) -> Result<usize, MiddlewareError> {
         self.check(role, Action::Administer)?;
-        self.round_trip(Command::DlqLen)
+        let n = self.round_trip(Command::DlqLen)?;
+        self.record_access(AccessRecord::new(&role.0, "dlq_len", "{}", Some(n as u64)));
+        Ok(n)
     }
 
     /// Verify the store's tamper-evidence hash chains (permission-gated,
@@ -281,7 +369,14 @@ impl AuditHandle {
     /// blocking-friendly context (`spawn_blocking` in async code).
     pub fn verify_integrity(&self, role: &Role) -> Result<VerifyReport, MiddlewareError> {
         self.check(role, Action::Administer)?;
-        self.round_trip(Command::VerifyIntegrity)
+        let report = self.round_trip(Command::VerifyIntegrity)?;
+        self.record_access(AccessRecord::new(
+            &role.0,
+            "verify",
+            serde_json::json!({ "ok": report.ok }).to_string(),
+            Some(report.segments_checked as u64),
+        ));
+        Ok(report)
     }
 }
 
@@ -545,6 +640,31 @@ impl Worker {
             }
             Command::VerifyIntegrity(reply) => {
                 let _ = reply.send(Ok(self.verify()));
+            }
+            Command::RecordAccess(rec) => {
+                // fail-open: dropping a meta-audit record must not stall the
+                // writer loop; the warn line is the operator's signal
+                if let Err(e) = self.store.record_access(*rec) {
+                    tracing::warn!(error = %e, "meta-audit access record could not be persisted");
+                }
+            }
+            Command::QueryAccess { actor, q, reply } => {
+                let res = self.store.access_records(&q).map_err(MiddlewareError::Core);
+                if let Ok(records) = &res {
+                    // reading the access log is itself an access — recorded
+                    // here as a direct append (never as another command), so
+                    // each read adds exactly one record: no recursion
+                    let rec = AccessRecord::new(
+                        actor,
+                        "query_access",
+                        summarize_access_query(&q),
+                        Some(records.len() as u64),
+                    );
+                    if let Err(e) = self.store.record_access(rec) {
+                        tracing::warn!(error = %e, "meta-audit access record could not be persisted");
+                    }
+                }
+                let _ = reply.send(res);
             }
         }
     }

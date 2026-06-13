@@ -20,6 +20,7 @@ pub use event::{AuditEvent, TargetSpec};
 pub use filter::{FilterDecision, FilterSet, PostFilter, PreFilter, RequestInfo, ResponseInfo};
 pub use layer::{ActorExtractor, AuditLayer, AuditService, EndpointRule, TargetExtractor};
 pub use permissions::{Action, PermissionPolicy, Role};
+pub use quipu_core::{AccessQuery, AccessRecord};
 pub use pipeline::{
     AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig, VerifyReport,
 };
