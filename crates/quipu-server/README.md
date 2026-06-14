@@ -374,7 +374,7 @@ Alerting starter pack: page on `quipu_writer_alive == 0`, `quipu_disk_full == 1`
 
 ## Disk-full behaviour
 
-What happens when the volume under the store root fills up is defined, not left to chance:
+What happens when the volume under the store root fills up is defined:
 
 1. **Early warning.** Every housekeeping interval (30s) the pipeline measures free space. Crossing below the `health` thresholds logs a `warn`, notifies the fallback hook once, flips `quipu_disk_low` to 1, and turns `/v1/healthz` `degraded`. This is the moment to act: grow the volume, lower `retention_max_bytes`, or run `POST /v1/admin/retention`.
 2. **ENOSPC.** A write that fails with "no space left on device" skips the retry/backoff loop entirely — the condition is persistent, so rewriting the same bytes can't succeed — and goes straight to the DLQ. The DLQ usually sits on the same full disk and also fails, so the event reaches the fallback hook and `quipu_events_lost_total`. The disk-full latch is set: `quipu_disk_full` reads 1 and `/v1/healthz` answers 503.
@@ -385,7 +385,7 @@ The matching *prevention* knob is `retention_max_bytes`: give the store a byte b
 
 ## Availability and recovery
 
-The daemon is a single process by design (see the [root README's scope section](../../README.md#scaling-out-sharded-trees-not-a-distributed-tree)): one writer is what keeps the store to one file lock and one append-only Merkle tree per table. That makes the daemon a single point of availability — while it's down, callers' audit trails stall — so the project solves availability at the *client*, not by replicating the tree.
+The daemon is a single process by design (see the [root README's scope section](../../README.md#scaling-out-sharded-trees)): one writer is what keeps the store to one file lock and one append-only Merkle tree per table. That makes the daemon a single point of availability — while it's down, callers' audit trails stall — so the project solves availability at the *client*, not by replicating the tree.
 
 ### Idempotent appends
 
@@ -404,7 +404,7 @@ The window is in memory by design. A retransmission that straddles a server rest
 
 ### Cold-standby failover
 
-Recover from a failed or stopped node by cold standby, not live failover. There's no second writer to fail over *to* — that's the point of the single-writer design.
+Recover from a failed or stopped node by cold standby. There's no second writer to fail over *to* — that's the point of the single-writer design.
 
 1. **Quiesce the active node** if it's still up: send `SIGINT`/`SIGTERM` for a clean shutdown (final fsync), or call `POST /v1/admin/flush` to push the active segment and registry tail to disk. Sealed segments are already immutable and safe to copy anytime; this step only settles the *active* tail.
 2. **Copy the store root** to the standby host (`rsync`, snapshot, or restore from backup — see the root README's export/backup notes). Because sealed segments never change, an incremental copy only moves the active tail.
@@ -423,7 +423,7 @@ Mirror every durably-written event to a syslog collector (RFC 5424 over UDP) by 
 
 Each accepted event becomes one syslog line whose message is a compact JSON summary: log id, actor, method, url, target ids, custom-column keys. The event **`content` is not forwarded** — it can be large or hold protected values, and the store is the system of record, so the SIEM gets the audit-trail skeleton.
 
-The mirror is **best-effort and never back-pressures writes**: a dedicated thread owns the socket, the writer thread only does a non-blocking enqueue, and a full backlog drops lines (counted, logged sparsely) rather than stalling persistence. It fires on success only — a DLQ-parked event isn't mirrored.
+The mirror is **best-effort and never back-pressures writes**: a dedicated thread owns the socket, the writer thread only does a non-blocking enqueue, and a full backlog drops lines (counted, logged sparsely). It fires on success only — a DLQ-parked event isn't mirrored.
 
 Syslog is the one sink the daemon ships (no extra dependency). A webhook / Kafka / other sink is the same shape — a `quipu_middleware::SinkFn` closure — for embedded users who run the pipeline directly.
 

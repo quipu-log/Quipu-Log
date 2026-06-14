@@ -69,7 +69,7 @@ Wire it into an MCP client (e.g. Claude Desktop / Claude Code) as a stdio server
 }
 ```
 
-The transport is plaintext HTTP by design. Run `quipu-mcp` co-located with `quipu-server` — same host or trusted segment — against its plain-HTTP listener. For a remote leg, put a TLS-terminating sidecar in front rather than teaching this client TLS. The point is to keep the agent-facing binary tiny and (almost) dependency-free.
+The transport is plaintext HTTP by design. Run `quipu-mcp` co-located with `quipu-server` — same host or trusted segment — against its plain-HTTP listener. For a remote leg, put a TLS-terminating sidecar in front. The point is to keep the agent-facing binary tiny and (almost) dependency-free.
 
 ## The tools
 
@@ -79,7 +79,7 @@ The transport is plaintext HTTP by design. Run `quipu-mcp` co-located with `quip
 | `get_entity_history` | `{ "entity_type", "entity_id" }` | "how did this entity change over time" — every recorded version, oldest first. |
 | `verify_store_integrity` | `{}` | "has the log been altered" — runs the Merkle integrity verification; `ok:false` names the first break. |
 
-Tool failures come back as normal results with `isError: true` and a readable message (e.g. "the audit server is unreachable, try again"), so the agent can reason about them instead of crashing the session.
+Tool failures come back as normal results with `isError: true` and a readable message (e.g. "the audit server is unreachable, try again"), so the agent can reason about them.
 
 ## A demo scenario
 

@@ -10,10 +10,10 @@ If you're embedding Quipu-Log in a Rust service, this is your entry point. `quip
 
 | concern | what this crate adds |
 |---|---|
-| **non-blocking writes** | `AuditPipeline` owns the store on a dedicated writer thread. `handle.emit()` is a bounded-channel enqueue — nanoseconds on the request path — never a disk write. |
+| **non-blocking writes** | `AuditPipeline` owns the store on a dedicated writer thread. `handle.emit()` is a bounded-channel enqueue — nanoseconds on the request path. |
 | **durability under failure** | failed writes retry; events that exhaust retries park in a disk-backed DLQ that survives restarts (`redrive_dlq`); a `FallbackFn` hook catches the last-resort losses so you can page on them. |
 | **permissions** | `PermissionPolicy` gates every `emit` / `query` / administer call by `Role`, deny- or allow-by-default. |
-| **HTTP auditing** | `AuditLayer` is a `tower` Layer that records chosen endpoints automatically — no manual `emit` in handlers. |
+| **HTTP auditing** | `AuditLayer` is a `tower` Layer that records chosen endpoints automatically. |
 | **observability** | `handle.metrics()` and `handle.health()` read lock-free atomics (queue depth, DLQ size, write latency, writer liveness, disk-full latch) without touching the writer thread. |
 | **horizontal scale** | `ShardRouter` fronts N independent single-writer chains, routing writes by tenant and fanning queries out — see [Sharding](#sharding). |
 

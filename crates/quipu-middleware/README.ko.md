@@ -10,10 +10,10 @@ Rust 서비스에 Quipu-Log를 임베드한다면 여기가 진입점이다. `qu
 
 | 관심사 | 이 크레이트가 더하는 것 |
 |---|---|
-| **논블로킹 쓰기** | `AuditPipeline`이 전용 writer 스레드에서 스토어를 소유한다. `handle.emit()`은 바운디드 채널에 넣는 것 — 요청 경로에서 나노초, 디스크 쓰기가 아님. |
+| **논블로킹 쓰기** | `AuditPipeline`이 전용 writer 스레드에서 스토어를 소유한다. `handle.emit()`은 바운디드 채널에 넣는 것 — 요청 경로에서 나노초. |
 | **장애 내구성** | 실패한 쓰기는 재시도하고, 재시도를 소진한 이벤트는 재시작에도 살아남는 디스크 기반 DLQ에 적재(`redrive_dlq`). 마지막 손실은 `FallbackFn` 훅이 잡아 페이징할 수 있다. |
 | **권한** | `PermissionPolicy`가 모든 `emit`/`query`/administer 호출을 `Role` 기준으로 통제(기본 거부 또는 기본 허용). |
-| **HTTP 감사** | `AuditLayer`는 선택한 엔드포인트를 자동 기록하는 `tower` Layer — 핸들러에 수동 `emit` 불필요. |
+| **HTTP 감사** | `AuditLayer`는 선택한 엔드포인트를 자동 기록하는 `tower` Layer. |
 | **관측성** | `handle.metrics()`/`handle.health()`가 락 없는 atomic을 읽는다(큐 깊이, DLQ 크기, 쓰기 지연, writer 생존, disk-full 래치) — writer 스레드를 건드리지 않음. |
 | **수평 확장** | `ShardRouter`가 독립 단일-writer 트리 N개를 앞에서 받아 테넌트별로 쓰기를 라우팅하고 읽기를 fan-out — [샤딩](#샤딩) 참조. |
 

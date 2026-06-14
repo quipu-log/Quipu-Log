@@ -6,7 +6,7 @@ Reference client for [`quipu-server`](../quipu-server/README.md). It's the proto
 
 ## Why a client crate at all
 
-`quipu-server` is one process by design. A file lock keeps its Merkle-committed store to a single writer, which is what makes the tamper-evidence simple to reason about (see the [root README's scope section](../../README.md#scaling-out-sharded-trees-not-a-distributed-tree)).
+`quipu-server` is one process by design. A file lock keeps its Merkle-committed store to a single writer, which is what makes the tamper-evidence simple to reason about (see the [root README's scope section](../../README.md#scaling-out-sharded-trees)).
 
 The cost is a single point of availability. While the daemon is down or its write queue is full, a naïve caller's audit trail just stops. For audit logs, that's a compliance hole, not a transient glitch.
 
@@ -16,7 +16,7 @@ Replicating the chain across nodes would complicate the proof. So the project mo
 
 - **Idempotent retransmission** — each event carries a stable `Idempotency-Key`, reused across every retry. Resending a POST the server already accepted is recognized and dropped, not double-recorded.
 - **Exponential backoff with full jitter** — transient failures retry on a bounded, randomized schedule. A fleet reconnecting after an outage won't stampede the recovering daemon.
-- **Opt-in local disk spool** — when retries are exhausted, the event is appended (and fsynced) to a local file instead of dropped, then replayed once the server is back. That turns "the daemon was down" from *records lost* into *records arrived late*. Since the server keeps each event's client-set `occurred_at`, the lateness never shows in the final log. The spool is CRC-framed like the store's segments, so a crash-torn tail is detected and truncated on the next open.
+- **Opt-in local disk spool** — when retries are exhausted, the event is appended (and fsynced) to a local file, then replayed once the server is back. That turns "the daemon was down" from *records lost* into *records arrived late*. Since the server keeps each event's client-set `occurred_at`, the lateness never shows in the final log. The spool is CRC-framed like the store's segments, so a crash-torn tail is detected and truncated on the next open.
 
 ## No HTTP dependency
 

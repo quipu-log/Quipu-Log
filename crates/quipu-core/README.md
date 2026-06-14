@@ -57,7 +57,7 @@ The spine is never purged, so the current tree is always an extension of any hon
 
 Signing needs the RSA **private** key. A log-producing service configured with only the public key (the recommended split — it can encrypt fields but never read them back) can't sign, so checkpointing is **silently disabled** there. `checkpoint()` returns `Ok(None)`, segment seals skip the step, no `checkpoints.log` is created, and `verify_integrity()` simply has no checkpoints to check.
 
-This is a deliberate choice, not an error: write-path availability comes first. Run checkpointing where the private key lives, or accept spine-only tamper evidence on write-only nodes. (The Merkle root and proofs still work without a key — only the *signed* anchor needs one.)
+This is a deliberate choice: write-path availability comes first. Run checkpointing where the private key lives, or accept spine-only tamper evidence on write-only nodes. (The Merkle root and proofs still work without a key — only the *signed* anchor needs one.)
 
 ### External anchoring
 
