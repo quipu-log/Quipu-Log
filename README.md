@@ -35,6 +35,38 @@ your handler ──emit──▶ pipeline ─────────▶ store (
 
 Your code holds a cloneable **handle**; a dedicated writer thread owns the store.
 
+## Pattern: attach the related entities, and every relevant CUD follows
+
+When you log a create/update/delete, **attach every entity related to that change as a target.** Then later, whichever of those entities you start from, the related change history comes back in one query.
+
+`targets` is a relation table, so one log row can point at many entities. Log a single document edit with the *document, author, project, and parent folder* all as targets, and:
+
+- "every change to this document"
+- "every change this user touched"
+- "every change in this project"
+
+all become the *same logs reached through different doors* — written once, queryable from many angles.
+
+Because entities are versioned, a target's name can change later and **searching by the old name still surfaces that change.** A document that was `draft-v1` six months ago and is `final-report` now is found by either name, with its full history intact.
+
+```rust
+// Record: attach every entity related to the change as a target
+handle.emit(&actor, AuditEvent::new(...)
+    .target(doc_entity)
+    .target(author_entity)
+    .target(project_entity))?;
+
+// Query: enter from any door — past values match too
+handle.query(&auditor, LogQuery {
+    targets: vec![
+        TargetFilter::exact("document", "name", Value::Text("final-report".into())),
+    ],
+    ..Default::default()
+})?;
+```
+
+Query quality comes down to **how completely you attach relations at write time.** With the HTTP layer, encode "which entities to derive from this request" once in `target_extractor`, and every request records them consistently without anyone having to remember.
+
 ## Quick start
 
 ```sh
@@ -111,7 +143,7 @@ let app = Router::new().route(...).layer(layer);
 
 ### Entity types
 
-A log row carries `log_id`, `timestamp` (UTC µs), `actor`, `method`, `url`, `targets`, `content`, plus any custom columns you register (text/number/json, validated per write). `targets` is a relation table, so one log can point at many entities. Fields are defined per type:
+A log row carries `log_id`, `timestamp` (UTC µs), `actor`, `method`, `url`, `targets`, `content`, plus any custom columns you register (text/number/json, validated per write). Fields are defined per type:
 
 ```rust
 store.define_type(TypeSchema::new("patient", vec![
