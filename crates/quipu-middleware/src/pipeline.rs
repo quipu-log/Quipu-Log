@@ -5,8 +5,8 @@ use crate::permissions::{Action, PermissionPolicy, Role};
 use quipu_core::storage::{SegmentReader, SegmentSlice, Table, TableScan};
 use quipu_core::{
     summarize_access_query, summarize_log_query, AccessQuery, AccessRecord, AuditLog, AuditStore,
-    Checkpoint, CustomColumnDef, LogQuery, LogView, QueryPage, ReadSnapshot, TargetSnapshot,
-    TypeSchema, Uid,
+    Checkpoint, ConsistencyProof, CustomColumnDef, Hash, InclusionProof, LogQuery, LogView,
+    QueryPage, ReadSnapshot, TargetSnapshot, TypeSchema, Uid,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -97,6 +97,24 @@ pub struct VerifyReport {
     /// Chain breaks or read errors. The core verification stops at the first
     /// break, so today this holds at most one entry.
     pub problems: Vec<String>,
+}
+
+/// A log's inclusion proof plus the Merkle root it verifies against — the full
+/// payload a third party needs (see [`AuditHandle::prove_inclusion`]).
+#[derive(Debug, Clone)]
+pub struct InclusionResponse {
+    /// Current Merkle root the proof verifies against.
+    pub root: Hash,
+    pub proof: InclusionProof,
+}
+
+/// A consistency proof plus the current Merkle root
+/// (see [`AuditHandle::prove_consistency`]).
+#[derive(Debug, Clone)]
+pub struct ConsistencyResponse {
+    /// Current Merkle root (the second/"now" root of the proof).
+    pub root: Hash,
+    pub proof: ConsistencyProof,
 }
 
 /// Called when an event could not be persisted and went to the DLQ (or the
@@ -190,6 +208,18 @@ enum Command {
     /// and has never checkpointed). Used to pin a shard's head for cross-shard
     /// anchoring ([`crate::ShardRouter::global_checkpoint`]).
     Checkpoint(SyncSender<Result<Option<Checkpoint>, MiddlewareError>>),
+    /// Prove that a log is committed to the current Merkle root (O(log n) audit
+    /// path + the root to verify it against). Runs on the writer thread: the
+    /// proof scan needs `&mut` store access.
+    ProveInclusion {
+        log_id: Uid,
+        reply: SyncSender<Result<InclusionResponse, MiddlewareError>>,
+    },
+    /// Prove the log tree of `first_size` is a prefix of the current tree.
+    ProveConsistency {
+        first_size: u64,
+        reply: SyncSender<Result<ConsistencyResponse, MiddlewareError>>,
+    },
     /// Fire-and-forget meta-audit append (no-op when the store's access log
     /// is disabled). A plain append — it can never produce another access
     /// record, which is what makes self-reference loops impossible.
@@ -526,6 +556,31 @@ impl AuditHandle {
     pub fn checkpoint(&self, role: &Role) -> Result<Option<Checkpoint>, MiddlewareError> {
         self.check(role, Action::Administer)?;
         self.round_trip(Command::Checkpoint)
+    }
+
+    /// Prove that the log with `log_id` is committed to the current Merkle root
+    /// (permission-gated, [`Action::Query`]). The returned root + audit path
+    /// verify with [`quipu_core::merkle::verify_inclusion`] without the rest of
+    /// the log. Runs on the writer thread (the proof scan needs `&mut` store).
+    pub fn prove_inclusion(
+        &self,
+        role: &Role,
+        log_id: Uid,
+    ) -> Result<InclusionResponse, MiddlewareError> {
+        self.check(role, Action::Query)?;
+        self.round_trip(|reply| Command::ProveInclusion { log_id, reply })
+    }
+
+    /// Prove the log tree of size `first_size` is a prefix of the current tree
+    /// (permission-gated, [`Action::Query`]). Verifies with
+    /// [`quipu_core::merkle::verify_consistency`].
+    pub fn prove_consistency(
+        &self,
+        role: &Role,
+        first_size: u64,
+    ) -> Result<ConsistencyResponse, MiddlewareError> {
+        self.check(role, Action::Query)?;
+        self.round_trip(|reply| Command::ProveConsistency { first_size, reply })
     }
 }
 
@@ -886,6 +941,28 @@ impl Worker {
                     let cps = self.store.checkpoints().map_err(MiddlewareError::Core)?;
                     Ok(cps.into_iter().next_back())
                 })();
+                let _ = reply.send(res);
+            }
+            Command::ProveInclusion { log_id, reply } => {
+                let res = self
+                    .store
+                    .prove_inclusion(log_id)
+                    .map(|proof| InclusionResponse {
+                        root: self.store.merkle_root(),
+                        proof,
+                    })
+                    .map_err(MiddlewareError::Core);
+                let _ = reply.send(res);
+            }
+            Command::ProveConsistency { first_size, reply } => {
+                let res = self
+                    .store
+                    .prove_consistency(first_size)
+                    .map(|proof| ConsistencyResponse {
+                        root: self.store.merkle_root(),
+                        proof,
+                    })
+                    .map_err(MiddlewareError::Core);
                 let _ = reply.send(res);
             }
             Command::RecordAccess(rec) => {

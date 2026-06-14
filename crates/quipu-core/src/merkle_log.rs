@@ -131,6 +131,40 @@ impl MerkleLog {
         Ok(())
     }
 
+    /// Every committed leaf hash, in append order. Flushes first so the buffer
+    /// is visible. Used by table verification to re-derive leaves against the
+    /// surviving record payloads.
+    pub fn leaves(&mut self) -> Result<Vec<Hash>> {
+        self.flush()?;
+        load(&self.path)
+    }
+
+    /// Truncate the spine back to `new_size` leaves and rebuild the root
+    /// tracker. Used only by crash reconciliation: when a torn segment tail was
+    /// truncated below what the spine already recorded, the orphaned leaves
+    /// correspond to records that never became durable, so dropping them keeps
+    /// the spine and segments consistent. `new_size` must not exceed the current
+    /// size.
+    pub fn truncate(&mut self, new_size: u64) -> Result<()> {
+        self.flush()?;
+        let leaves = load(&self.path)?;
+        let n = leaves.len() as u64;
+        if new_size > n {
+            return Err(Error::Encode(format!(
+                "cannot truncate spine to {new_size}: only {n} leaves present"
+            )));
+        }
+        if new_size == n {
+            return Ok(());
+        }
+        let valid_len = HEADER as u64 + new_size * ENTRY as u64;
+        self.writer.flush()?;
+        self.writer.get_ref().set_len(valid_len)?;
+        self.writer.seek(SeekFrom::Start(valid_len))?;
+        self.roots = Roots::from_leaves(&leaves[..new_size as usize]);
+        Ok(())
+    }
+
     /// Flush and fsync — the spine must be at least as durable as any
     /// checkpoint that pins its root.
     pub fn sync(&mut self) -> Result<()> {

@@ -468,9 +468,9 @@ fn verify_integrity_detects_in_place_tampering() {
         .find(|p| p.extension().is_some_and(|e| e == "log"))
         .unwrap();
     let mut bytes = std::fs::read(&seg).unwrap();
-    // first byte of the first record's payload: 37-byte segment header
-    // (magic+version+seed) + 48-byte frame header (len+crc+ts+chain)
-    bytes[37 + 48] ^= 0xff;
+    // first byte of the first record's payload: 13-byte segment header
+    // (magic+version+base_index) + 16-byte frame header (len+crc+ts)
+    bytes[13 + 16] ^= 0xff;
     std::fs::write(&seg, &bytes).unwrap();
 
     assert!(store.verify_integrity().is_err());

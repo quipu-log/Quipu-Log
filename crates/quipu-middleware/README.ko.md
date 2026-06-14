@@ -15,7 +15,7 @@ Rust 서비스에 Quipu-Log를 임베드한다면 여기가 진입점이다. `qu
 | **권한** | `PermissionPolicy`가 모든 `emit`/`query`/administer 호출을 `Role` 기준으로 통제(기본 거부 또는 기본 허용). |
 | **HTTP 감사** | `AuditLayer`는 선택한 엔드포인트를 자동 기록하는 `tower` Layer — 핸들러에 수동 `emit` 불필요. |
 | **관측성** | `handle.metrics()`/`handle.health()`가 락 없는 atomic을 읽는다(큐 깊이, DLQ 크기, 쓰기 지연, writer 생존, disk-full 래치) — writer 스레드를 건드리지 않음. |
-| **수평 확장** | `ShardRouter`가 독립 단일-writer 체인 N개를 앞에서 받아 테넌트별로 쓰기를 라우팅하고 읽기를 fan-out — [샤딩](#샤딩) 참조. |
+| **수평 확장** | `ShardRouter`가 독립 단일-writer 트리 N개를 앞에서 받아 테넌트별로 쓰기를 라우팅하고 읽기를 fan-out — [샤딩](#샤딩) 참조. |
 
 ## Quick start
 
@@ -62,7 +62,7 @@ handle.emit(&Role::new("svc"), event)?;   // 논블로킹
 
 ## 샤딩
 
-파이프라인 하나 = 스토어 하나 위 writer 스레드 하나 — 해시 체인을 끊김 없는 한 줄로 유지하는 불변식이다. 이 천장을 깨뜨리지 않고 넘으려고, `ShardRouter`는 **독립 파이프라인 N개**를 앞에서 받는다. 각각이 완결된 단일-writer 체인 + 레지스트리 + 체크포인트다:
+파이프라인 하나 = 스토어 하나 위 writer 스레드 하나 — 각 Merkle 트리를 끊김 없는 append-only 한 줄로 유지하는 불변식이다. 이 천장을 깨뜨리지 않고 넘으려고, `ShardRouter`는 **독립 파이프라인 N개**를 앞에서 받는다. 각각이 완결된 단일-writer 트리 + 레지스트리 + 체크포인트다:
 
 ```rust,no_run
 use quipu_middleware::{ShardMap, ShardRouter};
@@ -82,10 +82,10 @@ let page = router.query_page(&role, Some("tenant-acme"), q, None, 100)?;
 
 핵심 성질(전체 모델은 [`docs/specs/horizontal-scaling`](../../docs/specs/horizontal-scaling/solution-design.md)):
 
-- **라우팅은 테넌트 기준 일관 해싱.** 한 테넌트의 쓰기는 항상 한 샤드로 — 그 테넌트 체인이 샤드를 가로질러 쪼개지지 않는다.
+- **라우팅은 테넌트 기준 일관 해싱.** 한 테넌트의 쓰기는 항상 한 샤드로 — 그 테넌트 트리가 샤드를 가로질러 쪼개지지 않는다.
 - **글로벌 순서 없음.** 샤드 간 읽기는 `(timestamp_micros, log_id)`로 머지한다. 감사 로그에 단일 글로벌 시퀀스가 필요한 경우는 드물다 — 샤드별 순서 + 샤드별 서명 체크포인트면 충분. 시계는 정상으로 유지(NTP).
-- **리샤딩은 추가 전용.** 체인은 재배치 불가라, 성장 시 기존 샤드를 `freeze`(읽기 전용, 영원히 단일-writer)하고 새 쓰기는 새 샤드로 보낸다. 그러면 한 테넌트 이력이 frozen + active 샤드에 걸치고, 테넌트 스코프 읽기가 둘 다 자동으로 본다.
-- **샤드 간 무결성.** 샤드별 `verify`는 샤드 *내부* 변조를 잡고, `GlobalCheckpoint`/`verify_global`은 샤드별 체크포인트 head + 샤드맵 매니페스트를 한 서명으로 묶어 샤드 *세트*에 대한 공격(샤드 통째 삭제·롤백·매니페스트 변조)을 잡는다. 샤드 retention 실행 후엔 재앵커할 것(정당하게 줄어든 record_count가 롤백처럼 보일 수 있으므로).
+- **리샤딩은 추가 전용.** 트리는 재배치 불가라, 성장 시 기존 샤드를 `freeze`(읽기 전용, 영원히 단일-writer)하고 새 쓰기는 새 샤드로 보낸다. 그러면 한 테넌트 이력이 frozen + active 샤드에 걸치고, 테넌트 스코프 읽기가 둘 다 자동으로 본다.
+- **샤드 간 무결성.** 샤드별 `verify`는 샤드 *내부* 변조를 잡고, `GlobalCheckpoint`/`verify_global`은 샤드별 Merkle 루트 + 트리 크기 + 샤드맵 매니페스트를 한 서명으로 묶어 샤드 *세트*에 대한 공격(샤드 통째 삭제·롤백=크기 감소·rewrite=같은 크기에 루트 변경·매니페스트 변조)을 잡는다. 트리 크기는 단조 증가라 retention 실행이 더 이상 롤백처럼 보이지 않는다.
 
 `quipu-server`는 config에 `[shards]` 섹션이 있으면 자동으로 라우터로 전환한다. 단일 스토어 모드는 바이트·와이어 호환을 유지한다. [quipu-server README](../quipu-server/README.ko.md) 참조.
 

@@ -307,7 +307,7 @@ fn corrupt_dlq_entry_is_quarantined_and_redrive_continues() {
     // append a frame whose payload is NOT a valid DlqEntry
     let seg = dir.path().join("dlq").join("seg-0000000000.log");
     {
-        let mut s = quipu_core::storage::Segment::open(&seg, [0u8; 32]).unwrap();
+        let mut s = quipu_core::storage::Segment::open(&seg, 0).unwrap();
         s.append(b"definitely not a bincode DlqEntry", 1).unwrap();
         s.sync().unwrap();
     }

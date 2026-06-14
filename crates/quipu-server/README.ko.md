@@ -128,7 +128,7 @@ kill -HUP "$(pgrep -f quipu-server)"
 4. 출력된 요약을 확인한 뒤 **옛 RSA 개인 키를 폐기합니다.** 이제 그 키로는 스토어의 어떤 값도 복호화할 수 없습니다. 옛 HMAC 키와 옛 공개 키는 남겨둡니다.
 5. 서비스를 다시 올립니다.
 
-re-key는 레지스트리 테이블을 다시 쓰는 작업이라 해시 체인이 새로 생기는데, 이는 변조가 남기는 흔적과 똑같이 생겼습니다. 그래서 re-key는 레지스트리마다 "옛 체인 헤드 → 새 체인 헤드" 전환을 기록한 **서명된 re-key 이벤트**를 체인으로 묶인 메타 테이블에 남깁니다. `verify_integrity()`는 모든 re-key 서명을 검증하고, 각 체인에 최신 이벤트가 서명한 헤드가 아직 있는지 확인합니다. 감사된 re-key와 말 없는 재작성이 그렇게 구분됩니다.
+re-key는 레지스트리 테이블을 다시 쓰는 작업이라 Merkle 트리가 새로 생기는데, 이는 변조가 남기는 흔적과 똑같이 생겼습니다. 그래서 re-key는 레지스트리마다 "옛 루트 → 새 루트" 전환을 기록한 **서명된 re-key 이벤트**를 메타 테이블에 남깁니다. `verify_integrity()`는 모든 re-key 서명을 검증하고, 각 레지스트리의 현재 트리가 최신 이벤트가 서명한 루트와 일관되는지(consistency proof) 확인합니다. 감사된 re-key와 말 없는 재작성이 그렇게 구분됩니다.
 
 한계 두 가지. HMAC 필드는 일방향이고 평문이 디스크에 없어 re-key가 **안 됩니다.** 검색을 위해 옛 HMAC 키를 계속 보관해야 하고, HMAC 키가 한 번 새면 그 키로 쓴 다이제스트는 영구히 노출된 것입니다. 그리고 re-key의 범위는 레지스트리입니다. 로그 행의 `method`/`url`/`content`는 설계상 평문이라 돌릴 키가 없습니다.
 
@@ -177,6 +177,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
 | `POST /v1/logs/export` | query | `LogQuery` JSON → `application/x-ndjson` (한 줄에 `LogView` 하나) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (최신 버전) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (오래된 것부터) |
+| `GET /v1/proof/inclusion/{log_id}` | query | Merkle inclusion proof → `{leaf_index, tree_size, leaf, audit_path[], merkle_root}` (hex). purge/미상이면 404. 샤드 모드는 테넌트 헤더로 라우팅. |
+| `GET /v1/proof/consistency?from=` | query | 크기 `from`→현재의 Merkle consistency proof → `{first_size, second_size, proof[], merkle_root}` (hex). |
 | `POST /v1/access/query` | administer | `AccessQuery` JSON(`from_micros`/`to_micros`/`actor`/`operation`/`limit`, 모두 선택) → `[AccessRecord]`. 메타 감사 — 누가 스토어를 조회·관리했는지. `store.access_log: true`가 필요합니다(아니면 400). 이 조회 자체도 정확히 한 건씩 기록됩니다. |
 | `POST /v1/admin/flush` | administer | 큐에 쌓인 것 전부 fsync → 204 |
 | `POST /v1/admin/redrive` | administer | `{"redriven": n, "requeued": n, "quarantined_entries": n, "quarantined_segments": n}` — 손상된 DLQ 데이터는 redrive를 실패시키는 대신 `<dlq>.quarantine/`으로 격리 |
@@ -279,7 +281,7 @@ curl -s -X POST localhost:7700/v1/types \
 
 ## 무결성 검증
 
-모든 테이블은 해시 체인입니다(`sha256(직전 체인 값 || payload)`, 세그먼트 경계를 넘어도 이어집니다). 그래서 기록을 제자리에서 고치거나 세그먼트를 빼돌리고 바꿔치기하면 나중에라도 들통납니다. 임베디드에서는 `AuditStore::verify_integrity()`로 확인하는데, 서버는 같은 검사를 두 가지 방법으로 노출합니다.
+모든 테이블은 RFC 6962 Merkle history tree에 커밋됩니다(leaf `sha256(0x00 || payload)`, retention-독립 spine에 보관). 그래서 기록을 제자리에서 고치거나 세그먼트를 빼돌리고 바꿔치기하면 나중에라도 들통납니다. 임베디드에서는 `AuditStore::verify_integrity()`로 확인하는데, 서버는 같은 검사를 두 가지 방법으로 노출합니다.
 
 **필요할 때** — `POST /v1/admin/verify` (administer 권한):
 
@@ -297,7 +299,16 @@ curl -s -X POST localhost:7700/v1/admin/verify \
 }
 ```
 
-체인이 끊긴 걸 찾았다면 그건 검증이 *제대로 일한* 겁니다. 그래서 응답은 여전히 200이고, 대신 `"ok": false`와 함께 끊긴 지점이 `problems`에 담겨 옵니다(검증은 첫 번째 끊김에서 멈추므로 항목은 많아야 하나입니다). 검증 자체를 돌리지 못했을 때만 에러 상태 코드가 나갑니다.
+끊긴 걸 찾았다면 그건 검증이 *제대로 일한* 겁니다. 그래서 응답은 여전히 200이고, 대신 `"ok": false`와 함께 끊긴 지점이 `problems`에 담겨 옵니다(검증은 첫 번째 끊김에서 멈추므로 항목은 많아야 하나입니다). 검증 자체를 돌리지 못했을 때만 에러 상태 코드가 나갑니다.
+
+### 제3자 Merkle 증명
+
+`verify`가 *운영자*의 자체 점검이라면, 증명 엔드포인트는 **누구나** 서명된 루트에 대해 레코드의 위치를 확인하게 해줍니다 — 전체 로그 없이, 데몬을 신뢰하지 않고도. 둘 다 `query` 권한이 필요하고, 샤드 모드에서는 테넌트 헤더로 해당 샤드가 답합니다(증명은 샤드별).
+
+- `GET /v1/proof/inclusion/{log_id}` — 로그가 현재 루트에 커밋돼 있음을 증명. `leaf_index`, `tree_size`, `leaf`, `audit_path[]`, `merkle_root`(모두 hex) 반환. RFC 6962 inclusion 알고리즘으로 검증. 보존 정책으로 purge됐거나 미상이면 404.
+- `GET /v1/proof/consistency?from=<size>` — 크기 `from` 트리가 현재 트리의 prefix(append-only)임을 증명. `first_size`, `second_size`, `proof[]`, `merkle_root` 반환. `from`은 보통 감사자가 앵커해 둔 체크포인트의 `tree_size`.
+
+`log_id`는 쿼리 결과의 값(`LogView.log_id`, 32자 hex 문자열)을 쓰고, 십진수 형태도 받습니다.
 
 **주기적으로** — 설정에 `verify` 섹션을 넣으세요.
 
@@ -305,12 +316,12 @@ curl -s -X POST localhost:7700/v1/admin/verify \
 "verify": { "interval_secs": 86400 }
 ```
 
-시작할 때 한 번 돌고, 그 뒤로는 interval마다 한 번씩 돕니다. 체인 끊김을 찾거나 검증을 돌리지 못하면 `error` 레벨로 로그를 남기니, 알림은 그 로그 라인에 걸어 두면 됩니다. 섹션을 빼면 주기 검증만 꺼지고 엔드포인트는 그대로 동작합니다.
+시작할 때 한 번 돌고, 그 뒤로는 interval마다 한 번씩 돕니다. 무결성 위반을 찾거나 검증을 돌리지 못하면 `error` 레벨로 로그를 남기니, 알림은 그 로그 라인에 걸어 두면 됩니다. 섹션을 빼면 주기 검증만 꺼지고 엔드포인트는 그대로 동작합니다.
 
 cron을 걸기 전에 알아둘 것 두 가지.
 
 - 검증은 한 번에 하나만 돕니다. 엔드포인트와 주기 태스크가 같은 자리를 나눠 쓰므로, 누가 돌고 있는 동안 엔드포인트는 **409**를 주고 주기 태스크는 경고만 남기고 그 차례를 건너뜁니다.
-- 검증은 모든 세그먼트를 **writer 스레드에서** 다시 읽습니다(체인이 스토어의 단일 writer 잠금 아래에 있기 때문입니다). 도는 동안 기록 요청은 디스크에 적히는 대신 파이프라인 큐에 쌓입니다. 보통 크기의 스토어라면 문제없지만, 아주 큰 스토어에 쓰기가 몰리는 환경이라면 한가한 시간대에 돌리거나, 검증 중 `POST /v1/logs`가 일부 503을 받을 수 있다고 보면 됩니다.
+- 검증은 모든 세그먼트를 **writer 스레드에서** 다시 읽습니다(Merkle 검증이 스토어의 단일 writer 잠금 아래에 있기 때문입니다). 도는 동안 기록 요청은 디스크에 적히는 대신 파이프라인 큐에 쌓입니다. 보통 크기의 스토어라면 문제없지만, 아주 큰 스토어에 쓰기가 몰리는 환경이라면 한가한 시간대에 돌리거나, 검증 중 `POST /v1/logs`가 일부 503을 받을 수 있다고 보면 됩니다.
 
 ## 헬스 체크
 
@@ -367,7 +378,7 @@ scrape_configs:
 
 ## 가용성과 복구
 
-데몬은 설계상 단일 프로세스입니다([루트 README의 스코프 절](../../README.ko.md#분산-저장을-지원하지-않는-이유) 참고). 단일 writer라야 스토어를 파일 락 하나, 끊기지 않는 해시 체인 하나로 묶을 수 있습니다. 그래서 데몬은 가용성의 단일 장애점이 됩니다 — 데몬이 죽으면 호출자의 감사 기록이 멈춥니다 — 그러므로 이 프로젝트는 체인을 복제하는 대신 가용성을 *클라이언트*에서 해결합니다.
+데몬은 설계상 단일 프로세스입니다([루트 README의 스코프 절](../../README.ko.md#수평-확장-분산-트리가-아니라-샤딩된-트리로) 참고). 단일 writer라야 스토어를 파일 락 하나, 테이블당 끊기지 않는 append-only Merkle 트리 하나로 묶을 수 있습니다. 그래서 데몬은 가용성의 단일 장애점이 됩니다 — 데몬이 죽으면 호출자의 감사 기록이 멈춥니다 — 그러므로 이 프로젝트는 트리를 복제하는 대신 가용성을 *클라이언트*에서 해결합니다.
 
 ### 멱등 append
 
@@ -386,7 +397,7 @@ curl -s -X POST localhost:7700/v1/logs \
 
 ### 콜드 스탠바이 페일오버
 
-장애 났거나 멈춘 노드는 라이브 페일오버가 아니라 콜드 스탠바이로 복구합니다. 페일오버 대상이 될 두 번째 writer가 없으니까요 — 그게 단일 체인 설계의 핵심입니다.
+장애 났거나 멈춘 노드는 라이브 페일오버가 아니라 콜드 스탠바이로 복구합니다. 페일오버 대상이 될 두 번째 writer가 없으니까요 — 그게 단일 writer 설계의 핵심입니다.
 
 1. **액티브 노드를 정지시킵니다.** 아직 살아 있으면 `SIGINT`/`SIGTERM`으로 정상 종료(마지막 fsync)하거나, `POST /v1/admin/flush`로 액티브 세그먼트와 레지스트리 꼬리를 디스크에 내립니다. 봉인된 세그먼트는 이미 불변이라 언제든 안전하게 복사됩니다. 이 단계는 *액티브* 꼬리만 안정시킵니다.
 2. **스토어 루트를 스탠바이 호스트로 복사합니다**(`rsync`, 스냅샷, 백업 복원 — 루트 README의 익스포트/백업 노트 참고). 봉인된 세그먼트는 절대 바뀌지 않으므로, 증분 복사는 액티브 꼬리만 옮깁니다.

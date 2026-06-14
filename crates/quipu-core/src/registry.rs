@@ -705,19 +705,30 @@ impl TypeRegistry {
         self.table.sync()
     }
 
-    /// Verify the tamper-evidence chain of this registry's version log.
-    pub fn verify(&mut self) -> Result<()> {
+    /// Verify the tamper-evidence of this registry's version log against its
+    /// Merkle spine. Returns the verified root.
+    pub fn verify(&mut self) -> Result<crate::merkle::Hash> {
         self.table.verify()
     }
 
-    /// Whether `target` is a chain value (or segment seed) of this registry's
-    /// version log — used to verify that the chain head signed by the latest
-    /// re-key event still exists in the chain.
-    pub(crate) fn contains_chain_value(
+    /// Current Merkle root over this registry's whole version history.
+    pub(crate) fn root(&self) -> crate::merkle::Hash {
+        self.table.root()
+    }
+
+    /// Total versions ever appended — the registry's Merkle tree size.
+    pub(crate) fn spine_size(&self) -> u64 {
+        self.table.spine_size()
+    }
+
+    /// Consistency proof that the tree of size `first_size` is a prefix of this
+    /// registry's current tree — used to verify the root signed by the latest
+    /// re-key event is still an honest prefix of the live registry.
+    pub(crate) fn prove_consistency(
         &mut self,
-        target: &crate::storage::ChainHash,
-    ) -> Result<bool> {
-        self.table.contains_chain_value(target)
+        first_size: u64,
+    ) -> Result<crate::merkle_log::ConsistencyProof> {
+        self.table.prove_consistency(first_size)
     }
 }
 

@@ -77,7 +77,7 @@ The transport is plaintext HTTP by design. Run `quipu-mcp` co-located with `quip
 |---|---|---|
 | `query_logs` | `{ "query": <LogQuery> }` | "who did what to which entity, when" — the full search surface (time range, actor, method, url, target attribute filters). |
 | `get_entity_history` | `{ "entity_type", "entity_id" }` | "how did this entity change over time" — every recorded version, oldest first. |
-| `verify_store_integrity` | `{}` | "has the log been altered" — runs the hash-chain verification; `ok:false` names the first break. |
+| `verify_store_integrity` | `{}` | "has the log been altered" — runs the Merkle integrity verification; `ok:false` names the first break. |
 
 Tool failures come back as normal results with `isError: true` and a readable message (e.g. "the audit server is unreachable, try again"), so the agent can reason about them instead of crashing the session.
 

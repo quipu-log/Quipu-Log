@@ -77,7 +77,7 @@ MCP 클라이언트(예: Claude Desktop / Claude Code)에 stdio 서버로 끼웁
 |---|---|---|
 | `query_logs` | `{ "query": <LogQuery> }` | "누가 어떤 엔티티에 무엇을 언제 했나" — 전체 검색 표면(시간 범위, actor, method, url, target 속성 필터). |
 | `get_entity_history` | `{ "entity_type", "entity_id" }` | "이 엔티티가 시간에 따라 어떻게 바뀌었나" — 기록된 모든 버전, 오래된 것부터. |
-| `verify_store_integrity` | `{}` | "로그가 변조됐나" — 해시 체인 검증 실행. `ok:false`면 첫 균열을 짚는다. |
+| `verify_store_integrity` | `{}` | "로그가 변조됐나" — Merkle 무결성 검증 실행. `ok:false`면 첫 균열을 짚는다. |
 
 tool 실패는 `isError: true`와 읽을 수 있는 메시지를 단 일반 결과로 돌아옵니다(예: "감사 서버에 닿지 않음, 재시도"). 그래서 에이전트는 세션을 죽이는 대신 그 상황을 추론할 수 있습니다.
 

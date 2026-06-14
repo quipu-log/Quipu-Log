@@ -170,11 +170,11 @@ fn run_rekey(config_path: &str) -> ! {
     );
     for t in &event.tables {
         println!(
-            "  registry '{}': {} records, chain {}.. -> {}..",
+            "  registry '{}': {} records, root {}.. -> {}..",
             t.type_name,
             t.records,
-            &t.old_chain_head[..12.min(t.old_chain_head.len())],
-            &t.new_chain_head[..12.min(t.new_chain_head.len())],
+            &t.old_root[..12.min(t.old_root.len())],
+            &t.new_root[..12.min(t.new_root.len())],
         );
     }
     println!(

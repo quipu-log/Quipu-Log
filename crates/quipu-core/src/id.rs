@@ -49,6 +49,27 @@ impl fmt::Display for Uid {
     }
 }
 
+/// Serialize a [`Uid`] as a 32-char hex string (for `#[serde(with = ...)]`).
+///
+/// The derived `Serialize` emits the raw `u128`, which JSON encoders without
+/// 128-bit integer support silently round through `f64` — lossy for a 128-bit
+/// id. Wire DTOs that must round-trip an id (e.g. [`crate::LogView`], so a
+/// client can ask for its Merkle inclusion proof) use this instead. Storage
+/// (bincode) keeps the compact derived form.
+pub mod hex_serde {
+    use super::Uid;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(uid: &Uid, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&uid.to_hex())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Uid, D::Error> {
+        let s = String::deserialize(d)?;
+        Uid::from_hex(&s).ok_or_else(|| serde::de::Error::custom(format!("invalid uid hex: {s}")))
+    }
+}
+
 impl fmt::Debug for Uid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Uid({})", self.to_hex())

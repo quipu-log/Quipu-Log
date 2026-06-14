@@ -34,7 +34,7 @@ use crate::permissions::Role;
 use crate::pipeline::{AuditHandle, AuditPipeline, MiddlewareError, RedriveReport, VerifyReport};
 use quipu_core::{
     AccessQuery, AccessRecord, CustomColumnDef, KeyRing, LogQuery, LogView, TargetSnapshot,
-    TypeSchema,
+    TypeSchema, Uid,
 };
 use std::collections::BTreeMap;
 
@@ -312,6 +312,42 @@ impl ShardRouter {
         Ok(combined)
     }
 
+    /// Prove a log's inclusion. A log id alone does not name a shard, so the
+    /// tenant's read targets are searched in turn; a per-shard "not found" means
+    /// "try the next shard", any other error aborts. The proof is against the
+    /// owning shard's own Merkle tree (proofs are per-shard — there is no global
+    /// tree; cross-shard integrity is the [`GlobalCheckpoint`]).
+    pub fn prove_inclusion(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        log_id: Uid,
+    ) -> Result<crate::InclusionResponse, MiddlewareError> {
+        for shard in self.map.read_targets(tenant) {
+            match self.handle(shard)?.prove_inclusion(role, log_id) {
+                Ok(r) => return Ok(r),
+                Err(MiddlewareError::Core(quipu_core::Error::NotFound(_))) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(MiddlewareError::Core(quipu_core::Error::NotFound(format!(
+            "log {log_id} not found on any shard for the given tenant"
+        ))))
+    }
+
+    /// Prove consistency for one shard's tree. Consistency is meaningful only
+    /// within a single shard's history, so this targets the shard that owns
+    /// `tenant` (the same shard an auditor's per-shard checkpoint came from).
+    pub fn prove_consistency(
+        &self,
+        role: &Role,
+        tenant: &str,
+        first_size: u64,
+    ) -> Result<crate::ConsistencyResponse, MiddlewareError> {
+        let shard = self.map.route_write(tenant);
+        self.handle(shard)?.prove_consistency(role, first_size)
+    }
+
     /// **Option D — cross-shard checkpoint anchoring.** Pin every shard's
     /// latest checkpoint head plus the routing manifest under one signature.
     /// This is the *global integrity* glue: per-shard [`verify`](Self::verify)
@@ -366,14 +402,24 @@ impl ShardRouter {
         for anc in &anchored.heads {
             match current_by_id.get(&anc.shard.0) {
                 None => problems.push(format!(
-                    "{}: shard is missing — its chain was deleted or detached since the anchor",
+                    "{}: shard is missing — its tree was deleted or detached since the anchor",
                     anc.shard
                 )),
-                Some(cur) if cur.record_count < anc.record_count => problems.push(format!(
-                    "{}: rolled back — {} records now, {} at anchor time \
-                     (records were removed or the chain was truncated)",
-                    anc.shard, cur.record_count, anc.record_count
+                Some(cur) if cur.tree_size < anc.tree_size => problems.push(format!(
+                    "{}: rolled back — tree size {} now, {} at anchor time \
+                     (records were removed or the log was truncated)",
+                    anc.shard, cur.tree_size, anc.tree_size
                 )),
+                Some(cur)
+                    if cur.tree_size == anc.tree_size
+                        && cur.merkle_root_hex != anc.merkle_root_hex =>
+                {
+                    problems.push(format!(
+                        "{}: merkle root changed at an unchanged tree size — the shard's history \
+                         was rewritten since the anchor",
+                        anc.shard
+                    ))
+                }
                 Some(_) => {}
             }
         }
@@ -396,8 +442,8 @@ impl ShardRouter {
             })?;
             heads.push(ShardHead {
                 shard,
-                chain_head_hex: cp.chain_head_hex(),
-                record_count: cp.record_count,
+                merkle_root_hex: cp.merkle_root_hex(),
+                tree_size: cp.tree_size,
             });
         }
         heads.sort_by_key(|h| h.shard.0);

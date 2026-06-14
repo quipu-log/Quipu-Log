@@ -1,40 +1,38 @@
 use crate::error::{Error, Result};
-use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Segment file header: magic, format version, hash-chain seed.
-/// The version byte is the migration hook — readers reject formats they do not
-/// understand instead of misparsing frames, so a future layout change can ship
-/// with a converter keyed on this byte. The seed is the final chain value of
-/// the previous segment (all-zero for the first segment of a table), which
-/// links segments into one continuous tamper-evident chain.
+/// Segment file header: magic + format version + base index. The version byte
+/// is the migration hook — readers reject formats they do not understand instead
+/// of misparsing frames.
+///
+/// Format v2 dropped the per-record hash chain entirely (no header seed, no
+/// per-frame chain hash). Tamper-evidence now lives in the retention-independent
+/// Merkle spine ([`crate::merkle_log`]); a segment carries only payloads plus a
+/// CRC for accidental-corruption detection. See [`crate::merkle`] for why the
+/// integrity backbone cannot live in purgeable segment frames.
+///
+/// `base_index` is the spine leaf index of this segment's first record — the
+/// count of all records appended to the table before this segment opened. It is
+/// written once at creation and lets a record's absolute Merkle position survive
+/// retention (which unlinks whole older segments): a surviving record's leaf
+/// index is `base_index + its offset within the segment`, independent of how
+/// many older segments were purged. Storing it per-segment (not as a mutable
+/// counter) is what makes the mapping crash-safe across a partial purge.
 pub const MAGIC: [u8; 4] = *b"ALOG";
-pub const FORMAT_VERSION: u8 = 1;
-pub const SEGMENT_HEADER: usize = MAGIC.len() + 1 + CHAIN_LEN;
+pub const FORMAT_VERSION: u8 = 2;
+pub const SEGMENT_HEADER: usize = MAGIC.len() + 1 + 8;
 
 /// Frame layout: u32 payload length, u32 crc32(payload), u64 record timestamp,
-/// 32-byte chain hash = sha256(previous chain value || payload).
-/// The timestamp lives in the header (not the payload) so retention can skim a
-/// segment's time range without deserializing rows. The chain hash is the
-/// tamper-evidence: CRC32 only catches accidental damage, but rewriting a
-/// record in place (even with a recomputed CRC) breaks the chain of every
-/// record after it, which [`verify_chain`] detects.
-pub const FRAME_HEADER: usize = 4 + 4 + 8 + CHAIN_LEN;
+/// then the payload. The timestamp lives in the header (not the payload) so
+/// retention can skim a segment's time range without deserializing rows. The
+/// CRC catches accidental damage only; in-place payload edits are caught by the
+/// Merkle spine, which verification re-derives leaf hashes against.
+pub const FRAME_HEADER: usize = 4 + 4 + 8;
 /// Hard upper bound for a single record; protects recovery from interpreting
 /// garbage as a multi-gigabyte length and trying to allocate it.
 pub const MAX_RECORD: u32 = 64 * 1024 * 1024;
-
-pub const CHAIN_LEN: usize = 32;
-pub type ChainHash = [u8; CHAIN_LEN];
-
-fn chain_next(prev: &ChainHash, payload: &[u8]) -> ChainHash {
-    let mut h = Sha256::new();
-    h.update(prev);
-    h.update(payload);
-    h.finalize().into()
-}
 
 /// What [`skim`] learned about an existing segment file.
 #[derive(Debug)]
@@ -49,8 +47,8 @@ pub struct Skim {
     /// Number of valid frames; feeds the table-level record count that
     /// integrity checkpoints attest to.
     pub records: u64,
-    /// Chain value stored in the last valid frame (the header seed if none).
-    pub last_chain: ChainHash,
+    /// Spine leaf index of this segment's first record (from the header).
+    pub base_index: u64,
 }
 
 /// One append-only segment file, opened for writing.
@@ -64,14 +62,15 @@ pub struct Segment {
     /// Highest record timestamp in the file; drives retention decisions.
     pub max_timestamp: u64,
     records: u64,
-    last_chain: ChainHash,
+    base_index: u64,
 }
 
 impl Segment {
-    /// Open (creating if needed) a segment for appending. `seed` is the chain
-    /// seed used only when the file is created; an existing file keeps its own.
-    /// A torn tail from a crash is truncated back to the last whole record.
-    pub fn open(path: &Path, seed: ChainHash) -> Result<Self> {
+    /// Open (creating if needed) a segment for appending. `base_index` is the
+    /// spine leaf index of the first record and is written only when the file is
+    /// created; an existing file keeps its own. A torn tail from a crash is
+    /// truncated back to the last whole record.
+    pub fn open(path: &Path, base_index: u64) -> Result<Self> {
         let skimmed = skim(path)?;
         // append-style open: existing contents must survive (truncate(false))
         let file = OpenOptions::new()
@@ -94,7 +93,7 @@ impl Segment {
                     min_timestamp: s.min_timestamp,
                     max_timestamp: s.max_timestamp,
                     records: s.records,
-                    last_chain: s.last_chain,
+                    base_index: s.base_index,
                 })
             }
             None => {
@@ -103,7 +102,7 @@ impl Segment {
                 let mut writer = BufWriter::with_capacity(256 * 1024, file);
                 writer.write_all(&MAGIC)?;
                 writer.write_all(&[FORMAT_VERSION])?;
-                writer.write_all(&seed)?;
+                writer.write_all(&base_index.to_le_bytes())?;
                 Ok(Self {
                     path: path.to_path_buf(),
                     writer,
@@ -111,7 +110,7 @@ impl Segment {
                     min_timestamp: u64::MAX,
                     max_timestamp: 0,
                     records: 0,
-                    last_chain: seed,
+                    base_index,
                 })
             }
         }
@@ -129,14 +128,14 @@ impl Segment {
         &self.path
     }
 
-    /// Chain value of the last appended record; seeds the next segment on roll.
-    pub fn last_chain(&self) -> ChainHash {
-        self.last_chain
-    }
-
     /// Number of records in this segment.
     pub fn records(&self) -> u64 {
         self.records
+    }
+
+    /// Spine leaf index of this segment's first record.
+    pub fn base_index(&self) -> u64 {
+        self.base_index
     }
 
     /// Append one framed payload. Returns the offset the record starts at.
@@ -150,18 +149,15 @@ impl Segment {
         }
         let offset = self.len;
         let crc = crc32fast::hash(payload);
-        let chain = chain_next(&self.last_chain, payload);
         self.writer
             .write_all(&(payload.len() as u32).to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(&timestamp.to_le_bytes())?;
-        self.writer.write_all(&chain)?;
         self.writer.write_all(payload)?;
         self.len += (FRAME_HEADER + payload.len()) as u64;
         self.min_timestamp = self.min_timestamp.min(timestamp);
         self.max_timestamp = self.max_timestamp.max(timestamp);
         self.records += 1;
-        self.last_chain = chain;
         Ok(offset)
     }
 
@@ -179,7 +175,8 @@ impl Segment {
     }
 }
 
-fn read_header(reader: &mut impl Read, path: &Path) -> Result<(u8, ChainHash)> {
+/// Returns the segment's `base_index` from the header.
+fn read_header(reader: &mut impl Read, path: &Path) -> Result<u64> {
     let mut head = [0u8; SEGMENT_HEADER];
     reader.read_exact(&mut head)?;
     if head[0..4] != MAGIC {
@@ -199,14 +196,13 @@ fn read_header(reader: &mut impl Read, path: &Path) -> Result<(u8, ChainHash)> {
             ),
         });
     }
-    let seed: ChainHash = head[5..SEGMENT_HEADER].try_into().unwrap();
-    Ok((version, seed))
+    let base_index = u64::from_le_bytes(head[5..SEGMENT_HEADER].try_into().unwrap());
+    Ok(base_index)
 }
 
 /// Skim an existing segment: validate the header and every frame (length +
 /// crc), returning `None` for a missing/empty file. Payloads are read only for
-/// the crc. Chain values are *recorded*, not verified — recovery must not
-/// destroy tamper evidence, so verification is the separate [`verify_chain`].
+/// the crc.
 pub fn skim(path: &Path) -> Result<Option<Skim>> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -219,12 +215,11 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
         return Ok(None);
     }
     let mut reader = BufReader::with_capacity(256 * 1024, file);
-    let (_, seed) = read_header(&mut reader, path)?;
+    let base_index = read_header(&mut reader, path)?;
     let mut valid = SEGMENT_HEADER as u64;
     let mut min_ts = u64::MAX;
     let mut max_ts = 0u64;
     let mut records = 0u64;
-    let mut last_chain = seed;
     let mut header = [0u8; FRAME_HEADER];
     let mut buf = Vec::new();
     loop {
@@ -235,7 +230,6 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
         let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let ts = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let chain: ChainHash = header[16..FRAME_HEADER].try_into().unwrap();
         if len > MAX_RECORD || total - valid - (FRAME_HEADER as u64) < len as u64 {
             break;
         }
@@ -248,62 +242,14 @@ pub fn skim(path: &Path) -> Result<Option<Skim>> {
         min_ts = min_ts.min(ts);
         max_ts = max_ts.max(ts);
         records += 1;
-        last_chain = chain;
     }
     Ok(Some(Skim {
         valid_len: valid,
         min_timestamp: min_ts,
         max_timestamp: max_ts,
         records,
-        last_chain,
+        base_index,
     }))
-}
-
-/// Recompute the hash chain over every record and compare it to the stored
-/// chain values. Returns `(seed, final chain)` so the caller can check
-/// cross-segment linkage. A record whose CRC is fine but whose chain does not
-/// match was modified in place after being written — that is tampering, not
-/// bit rot.
-pub fn verify_chain(path: &Path) -> Result<(ChainHash, ChainHash)> {
-    let mut r = SegmentReader::open(path)?;
-    let seed = r.seed;
-    let mut expect = seed;
-    loop {
-        let offset = r.offset;
-        match r.next_record_raw()? {
-            None => return Ok((seed, expect)),
-            Some((_, chain, payload)) => {
-                expect = chain_next(&expect, &payload);
-                if chain != expect {
-                    return Err(Error::Corrupt {
-                        segment: path.display().to_string(),
-                        offset,
-                        reason: "hash chain mismatch — record was modified after being written"
-                            .into(),
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// True if `target` equals this segment's header seed or any record's stored
-/// chain value. Checkpoint verification uses this to locate a checkpointed
-/// chain head: the seed case covers a head that was the final record of a
-/// segment retention has since unlinked (the next segment's seed equals it).
-/// Chain values are taken as stored — callers pair this with [`verify_chain`],
-/// which proves the stored values are honest.
-pub fn chain_contains(path: &Path, target: &ChainHash) -> Result<bool> {
-    let mut r = SegmentReader::open(path)?;
-    if &r.seed == target {
-        return Ok(true);
-    }
-    while let Some((_, chain, _)) = r.next_record_raw()? {
-        if &chain == target {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Sequential reader over one segment's records.
@@ -312,8 +258,6 @@ pub struct SegmentReader {
     reader: BufReader<File>,
     offset: u64,
     end: u64,
-    /// Chain seed from the file header.
-    pub seed: ChainHash,
 }
 
 impl SegmentReader {
@@ -328,28 +272,19 @@ impl SegmentReader {
         let file = File::open(path)?;
         let end = file.metadata()?.len().min(bound);
         let mut reader = BufReader::with_capacity(256 * 1024, file);
-        let seed = if end >= SEGMENT_HEADER as u64 {
-            read_header(&mut reader, path)?.1
-        } else {
-            [0; CHAIN_LEN] // torn header: no readable records anyway
-        };
+        if end >= SEGMENT_HEADER as u64 {
+            read_header(&mut reader, path)?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             reader,
             offset: SEGMENT_HEADER.min(end as usize) as u64,
             end,
-            seed,
         })
     }
 
     /// Read the next record as (timestamp, payload), or `None` at end of segment.
     pub fn next_record(&mut self) -> Result<Option<(u64, Vec<u8>)>> {
-        Ok(self
-            .next_record_raw()?
-            .map(|(ts, _, payload)| (ts, payload)))
-    }
-
-    fn next_record_raw(&mut self) -> Result<Option<(u64, ChainHash, Vec<u8>)>> {
         if self.end - self.offset < FRAME_HEADER as u64 {
             return Ok(None);
         }
@@ -358,7 +293,6 @@ impl SegmentReader {
         let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
         let ts = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let chain: ChainHash = header[16..FRAME_HEADER].try_into().unwrap();
         if len > MAX_RECORD || self.end - self.offset - (FRAME_HEADER as u64) < len as u64 {
             // torn tail: treat like EOF (writer-side recovery truncates it)
             return Ok(None);
@@ -373,7 +307,7 @@ impl SegmentReader {
             });
         }
         self.offset += (FRAME_HEADER + len as usize) as u64;
-        Ok(Some((ts, chain, buf)))
+        Ok(Some((ts, buf)))
     }
 }
 
@@ -381,14 +315,12 @@ impl SegmentReader {
 mod tests {
     use super::*;
 
-    const ZERO: ChainHash = [0; CHAIN_LEN];
-
     #[test]
     fn append_read_and_recover_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-0.log");
         {
-            let mut seg = Segment::open(&path, ZERO).unwrap();
+            let mut seg = Segment::open(&path, 0).unwrap();
             seg.append(b"alpha", 1).unwrap();
             seg.append(b"beta", 2).unwrap();
             seg.sync().unwrap();
@@ -398,7 +330,7 @@ mod tests {
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(&[9, 0, 0, 0, 1, 2]).unwrap();
         }
-        let mut seg = Segment::open(&path, ZERO).unwrap();
+        let mut seg = Segment::open(&path, 0).unwrap();
         assert_eq!(seg.max_timestamp, 2);
         seg.append(b"gamma", 3).unwrap();
         seg.sync().unwrap();
@@ -416,44 +348,31 @@ mod tests {
                 (3, b"gamma".to_vec())
             ]
         );
-        verify_chain(&path).unwrap();
     }
 
     #[test]
-    fn in_place_edit_with_fixed_crc_is_detected() {
+    fn crc_catches_accidental_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-0.log");
         {
-            let mut seg = Segment::open(&path, ZERO).unwrap();
+            let mut seg = Segment::open(&path, 0).unwrap();
             seg.append(b"original", 1).unwrap();
-            seg.append(b"second", 2).unwrap();
             seg.sync().unwrap();
         }
-        verify_chain(&path).unwrap();
-
-        // attacker rewrites the first payload AND fixes up its crc
-        let tampered = b"TAMPERED"; // same length as "original"
+        // flip a payload byte without fixing the crc
         {
             let mut f = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&path)
                 .unwrap();
-            f.seek(SeekFrom::Start((SEGMENT_HEADER + 4) as u64))
-                .unwrap();
-            f.write_all(&crc32fast::hash(tampered).to_le_bytes())
-                .unwrap();
             f.seek(SeekFrom::Start((SEGMENT_HEADER + FRAME_HEADER) as u64))
                 .unwrap();
-            f.write_all(tampered).unwrap();
+            f.write_all(b"X").unwrap();
         }
-
-        // crc-level reads still pass...
         let mut r = SegmentReader::open(&path).unwrap();
-        assert_eq!(r.next_record().unwrap().unwrap().1, tampered.to_vec());
-        // ...but the chain verification catches the rewrite
-        let err = verify_chain(&path).unwrap_err();
-        assert!(err.to_string().contains("hash chain mismatch"), "{err}");
+        let err = r.next_record().unwrap_err();
+        assert!(err.to_string().contains("crc mismatch"), "{err}");
     }
 
     #[test]
@@ -461,7 +380,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-0.log");
         {
-            let mut seg = Segment::open(&path, ZERO).unwrap();
+            let mut seg = Segment::open(&path, 0).unwrap();
             seg.append(b"x", 1).unwrap();
             seg.sync().unwrap();
         }

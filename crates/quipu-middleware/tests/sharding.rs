@@ -361,7 +361,7 @@ fn global_checkpoint_round_trips_and_signature_tamper_is_caught() {
     let gc = r.global_checkpoint(&role, &keys).unwrap();
     assert_eq!(gc.heads.len(), 3, "one pinned head per shard");
     assert!(
-        gc.heads.iter().all(|h| h.record_count > 0),
+        gc.heads.iter().all(|h| h.tree_size > 0),
         "every shard took some of the 30 tenants"
     );
 

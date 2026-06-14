@@ -1,7 +1,7 @@
-use super::segment::{
-    chain_contains, skim, verify_chain, ChainHash, Segment, SegmentReader, CHAIN_LEN,
-};
+use super::segment::{skim, Segment, SegmentReader};
 use crate::error::Result;
+use crate::merkle::{leaf_hash, Hash};
+use crate::merkle_log::{ConsistencyProof, InclusionProof, MerkleLog};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,6 +25,10 @@ struct SegmentMeta {
     min_timestamp: u64,
     max_timestamp: u64,
     records: u64,
+    /// Spine leaf index of this segment's first record (mirrors the segment
+    /// header, kept here so reopening never has to read sealed headers).
+    #[serde(default)]
+    base_index: u64,
 }
 
 /// In-memory bookkeeping for one sealed segment.
@@ -34,7 +38,8 @@ struct SealedSeg {
     meta: SegmentMeta,
 }
 
-/// A typed, append-only table: a directory of rolling segment files.
+/// A typed, append-only table: a directory of rolling segment files plus the
+/// retention-independent Merkle spine that holds every record's leaf hash.
 pub struct Table<T> {
     dir: PathBuf,
     active: Segment,
@@ -42,6 +47,10 @@ pub struct Table<T> {
     /// Sealed segments by sequence number. Used by scans (read in seq order),
     /// retention (drop whole old segments) and checkpointing (record count).
     sealed: BTreeMap<u64, SealedSeg>,
+    /// Append-only leaf-hash spine: the canonical integrity structure. Survives
+    /// retention (it is never purged), so the Merkle root and every
+    /// inclusion/consistency proof remain derivable after old segments are gone.
+    spine: MerkleLog,
     max_segment_bytes: u64,
     _marker: PhantomData<T>,
 }
@@ -70,17 +79,20 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
                 Some(m) => m,
                 None => {
                     // sidecar missing/unreadable (e.g. crash between seal and
-                    // meta write): rebuild it from a one-time skim
+                    // meta write): rebuild it from a one-time skim. The skim
+                    // recovers base_index from the segment header.
                     let m = skim(&path)?
                         .map(|s| SegmentMeta {
                             min_timestamp: s.min_timestamp,
                             max_timestamp: s.max_timestamp,
                             records: s.records,
+                            base_index: s.base_index,
                         })
                         .unwrap_or(SegmentMeta {
                             min_timestamp: u64::MAX,
                             max_timestamp: 0,
                             records: 0,
+                            base_index: 0,
                         });
                     write_meta(&meta_path(dir, seq), &m);
                     m
@@ -88,20 +100,85 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
             };
             sealed.insert(seq, SealedSeg { path, meta });
         }
-        // the seed only matters when the active file is brand new, i.e. the
-        // table is empty — an existing active segment keeps its own header
-        let active = Segment::open(&segment_path(dir, active_seq), [0; CHAIN_LEN])?;
-        Ok(Self {
+        // the base_index only matters when the active file is brand new, i.e.
+        // the table is empty — an existing active segment keeps its own header.
+        // When fresh, its base is the count of all already-sealed records.
+        let active_base = sealed
+            .values()
+            .map(|s| s.meta.base_index + s.meta.records)
+            .max()
+            .unwrap_or(0);
+        let active = Segment::open(&segment_path(dir, active_seq), active_base)?;
+        let spine = MerkleLog::open(dir)?;
+        let mut table = Self {
             dir: dir.to_path_buf(),
             active,
             active_seq,
             sealed,
+            spine,
             max_segment_bytes,
             _marker: PhantomData,
-        })
+        };
+        table.reconcile_spine()?;
+        Ok(table)
+    }
+
+    /// Bring the spine into lock-step with the segments after a crash. The
+    /// append path writes a record's payload to its segment first, then its leaf
+    /// hash to the spine, so a crash can leave the spine one or more leaves
+    /// behind; torn-tail recovery truncating a segment can leave the spine
+    /// ahead. Either way the segments are authoritative for *which records are
+    /// durable*, so the spine is repaired to match them.
+    ///
+    /// `expected_total` is the absolute count of records ever appended that
+    /// survive recovery: the active segment's base plus its record count
+    /// (segment bases are contiguous, so this is the high-water mark).
+    fn reconcile_spine(&mut self) -> Result<()> {
+        let expected_total = self.active.base_index() + self.active.records();
+        let spine_size = self.spine.size();
+        if spine_size > expected_total {
+            // spine ahead of durable records (segment lost a torn tail)
+            self.spine.truncate(expected_total)?;
+            self.spine.sync()?;
+            return Ok(());
+        }
+        if spine_size == expected_total {
+            return Ok(());
+        }
+        // spine behind: re-derive the missing tail leaves from the segments
+        // that hold records at absolute index >= spine_size, in append order.
+        let mut segments: Vec<(PathBuf, u64, u64)> = self
+            .sealed
+            .values()
+            .map(|s| (s.path.clone(), s.meta.base_index, s.meta.records))
+            .collect();
+        segments.push((
+            self.active.path().to_path_buf(),
+            self.active.base_index(),
+            self.active.records(),
+        ));
+        segments.sort_by_key(|(_, base, _)| *base);
+        for (path, base, records) in segments {
+            if base + records <= spine_size {
+                continue; // every leaf in this segment is already on the spine
+            }
+            let mut reader = SegmentReader::open(&path)?;
+            let mut idx = 0u64;
+            while let Some((_, payload)) = reader.next_record()? {
+                if base + idx >= spine_size {
+                    self.spine.append(leaf_hash(&payload))?;
+                }
+                idx += 1;
+            }
+        }
+        self.spine.sync()?;
+        Ok(())
     }
 
     /// Append a row. `timestamp` is the row's logical time (drives retention).
+    /// The payload lands in its segment first, then its leaf hash on the spine,
+    /// in lock-step — a crash between the two is repaired on reopen by
+    /// [`reconcile_spine`](Self::reconcile_spine).
     pub fn append(&mut self, row: &T, timestamp: u64) -> Result<()> {
         let payload = bincode::serialize(row)?;
         if !self.active.is_empty()
@@ -110,6 +187,7 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
             self.roll()?;
         }
         self.active.append(&payload, timestamp)?;
+        self.spine.append(leaf_hash(&payload))?;
         Ok(())
     }
 
@@ -119,6 +197,7 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
             min_timestamp: self.active.min_timestamp,
             max_timestamp: self.active.max_timestamp,
             records: self.active.records(),
+            base_index: self.active.base_index(),
         };
         // best-effort sidecar: a lost write is repaired by a skim on reopen
         write_meta(&meta_path(&self.dir, self.active_seq), &meta);
@@ -130,19 +209,20 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
             },
         );
         self.active_seq += 1;
-        // seed the new segment with the final chain value of the sealed one,
-        // so the tamper-evidence chain spans segment boundaries
-        let seed = self.active.last_chain();
-        self.active = Segment::open(&segment_path(&self.dir, self.active_seq), seed)?;
+        // the new segment's first record sits at the next absolute spine index
+        let next_base = meta.base_index + meta.records;
+        self.active = Segment::open(&segment_path(&self.dir, self.active_seq), next_base)?;
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.active.flush()
+        self.active.flush()?;
+        self.spine.flush()
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.active.sync()
+        self.active.sync()?;
+        self.spine.sync()
     }
 
     /// Stream every row in append order. The active segment is flushed first so
@@ -180,32 +260,51 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         Ok(slices)
     }
 
-    /// Verify the tamper-evidence hash chain across the whole table: every
-    /// record's chain value must match its recomputation, and each segment's
-    /// seed must equal the previous segment's final chain value. The oldest
-    /// retained segment's seed is not checked against anything — retention
-    /// legitimately drops old segments.
-    pub fn verify(&mut self) -> Result<()> {
+    /// Verify the table's tamper-evidence: re-derive each surviving record's
+    /// leaf hash from its payload and confirm it matches the spine leaf at the
+    /// record's absolute index (`segment base + offset`). An in-place payload
+    /// edit changes the recomputed leaf and is caught here; editing both the
+    /// payload and its spine leaf changes the Merkle root, which a signed
+    /// checkpoint pins. Finally the spine is checked against its own on-disk
+    /// leaves. Returns the verified Merkle root.
+    pub fn verify(&mut self) -> Result<Hash> {
         self.active.flush()?;
-        let mut prev: Option<ChainHash> = None;
-        let mut paths: Vec<PathBuf> = self.sealed.values().map(|s| s.path.clone()).collect();
-        paths.push(self.active.path().to_path_buf());
-        for path in paths {
-            let (seed, last) = verify_chain(&path)?;
-            if let Some(p) = prev {
-                if seed != p {
+        let leaves = self.spine.leaves()?;
+        let mut segments: Vec<(PathBuf, u64)> = self
+            .sealed
+            .values()
+            .map(|s| (s.path.clone(), s.meta.base_index))
+            .collect();
+        segments.push((self.active.path().to_path_buf(), self.active.base_index()));
+        segments.sort_by_key(|(_, base)| *base);
+        for (path, base) in segments {
+            let mut reader = SegmentReader::open(&path)?;
+            let mut idx = 0u64;
+            while let Some((_, payload)) = reader.next_record()? {
+                let abs = base + idx;
+                let expected =
+                    leaves
+                        .get(abs as usize)
+                        .ok_or_else(|| crate::error::Error::Corrupt {
+                            segment: path.display().to_string(),
+                            offset: abs,
+                            reason: "record has no matching leaf in the merkle spine — the spine \
+                                 was truncated or a segment was replaced"
+                                .into(),
+                        })?;
+                if leaf_hash(&payload) != *expected {
                     return Err(crate::error::Error::Corrupt {
                         segment: path.display().to_string(),
-                        offset: 0,
-                        reason: "chain seed does not match the previous segment — a segment \
-                                 was removed, reordered or replaced"
+                        offset: abs,
+                        reason: "record payload does not match its merkle leaf — the record \
+                                 was modified after being written"
                             .into(),
                     });
                 }
+                idx += 1;
             }
-            prev = Some(last);
         }
-        Ok(())
+        self.spine.verify()
     }
 
     /// Delete sealed segments whose newest record is older than `cutoff_micros`.
@@ -264,10 +363,27 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         self.active_seq
     }
 
-    /// Chain value of the newest record across the whole table (the seed of
-    /// the active segment when it is still empty — same value either way).
-    pub fn chain_head(&self) -> ChainHash {
-        self.active.last_chain()
+    /// Current Merkle root over every record ever appended (the canonical
+    /// integrity value a checkpoint signs and an anchor exports).
+    pub fn root(&self) -> Hash {
+        self.spine.root()
+    }
+
+    /// Total records ever appended (the Merkle tree size). Unlike
+    /// [`record_count`](Self::record_count) this never decreases — the spine is
+    /// not subject to retention.
+    pub fn spine_size(&self) -> u64 {
+        self.spine.size()
+    }
+
+    /// Absolute spine index of the oldest record still on disk — the count of
+    /// records retention has purged.
+    pub fn purged_count(&self) -> u64 {
+        self.sealed
+            .values()
+            .map(|s| s.meta.base_index)
+            .min()
+            .unwrap_or_else(|| self.active.base_index())
     }
 
     /// Records currently on disk across all segments. Decreases when
@@ -276,30 +392,34 @@ impl<T: Serialize + DeserializeOwned> Table<T> {
         self.active.records() + self.sealed.values().map(|s| s.meta.records).sum::<u64>()
     }
 
-    /// Whether `target` is the stored chain value of any record (or a segment
-    /// seed) in this table — see [`chain_contains`]. Drives checkpoint-head
-    /// verification.
-    pub fn contains_chain_value(&mut self, target: &ChainHash) -> Result<bool> {
-        self.active.flush()?;
-        for s in self.sealed.values() {
-            if chain_contains(&s.path, target)? {
-                return Ok(true);
-            }
-        }
-        chain_contains(self.active.path(), target)
+    /// Inclusion proof for the record at absolute spine index `leaf_index`
+    /// against the current tree.
+    pub fn prove_inclusion(&mut self, leaf_index: u64) -> Result<InclusionProof> {
+        self.spine.prove_inclusion(leaf_index)
+    }
+
+    /// Consistency proof that the tree of size `first_size` is a prefix of the
+    /// current tree (append-only history preserved).
+    pub fn prove_consistency(&mut self, first_size: u64) -> Result<ConsistencyProof> {
+        self.spine.prove_consistency(first_size)
     }
 }
 
 impl<T: Serialize + DeserializeOwned> Table<T> {
-    /// Drop every row: delete all sealed segments and start a fresh active
-    /// segment. Used by the DLQ redrive (read all, clear, re-append failures).
+    /// Drop every row: delete all sealed segments, reset the spine and start a
+    /// fresh active segment. This is a full table wipe (not append-only) — it
+    /// discards the Merkle history along with the data, so it must never be used
+    /// on an audit table whose integrity must be provable; it exists for
+    /// scratch/staging tables only.
     pub fn clear(&mut self) -> Result<()> {
         let old_active = self.active.path().to_path_buf();
         let old_seqs: Vec<u64> = self.sealed.keys().copied().collect();
         self.active_seq += 1;
         // open the new segment first so the old writer is dropped before its
         // file is unlinked (required for OS-independence, e.g. Windows)
-        self.active = Segment::open(&segment_path(&self.dir, self.active_seq), [0; CHAIN_LEN])?;
+        self.active = Segment::open(&segment_path(&self.dir, self.active_seq), 0)?;
+        self.spine.truncate(0)?;
+        self.spine.sync()?;
         std::fs::remove_file(old_active)?;
         for (_, s) in std::mem::take(&mut self.sealed) {
             std::fs::remove_file(s.path)?;
@@ -315,19 +435,19 @@ fn segment_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{SEGMENT_PREFIX}{seq:010}{SEGMENT_SUFFIX}"))
 }
 
-/// What [`rewrite_table`] did: the chain head before and after, and the
+/// What [`rewrite_table`] did: the Merkle root before and after, and the
 /// number of records carried over. The caller is expected to persist the
-/// head transition somewhere auditable — a rewritten chain is otherwise
-/// indistinguishable from a tampered one.
+/// root transition somewhere auditable — a rewritten table (fresh spine) is
+/// otherwise indistinguishable from a tampered one.
 #[derive(Debug, Clone)]
 pub struct RewriteStats {
-    pub old_chain_head: ChainHash,
-    pub new_chain_head: ChainHash,
+    pub old_root: Hash,
+    pub new_root: Hash,
     pub records: u64,
 }
 
 /// Rewrite every row of the table at `dir` through `f`, producing a *fresh*
-/// hash chain (zero seed). Row order and per-row timestamps are preserved.
+/// Merkle spine. Row order and per-row timestamps are preserved.
 ///
 /// The rewrite goes to a sibling `<dir>.rewrite` directory first and is
 /// fsynced before the swap, so a crash mid-rewrite leaves the original table
@@ -352,7 +472,7 @@ pub fn rewrite_table<T: Serialize + DeserializeOwned>(
     }
 
     let mut old: Table<T> = Table::open(dir, max_segment_bytes)?;
-    let old_chain_head = old.chain_head();
+    let old_root = old.root();
     let slices = old.slices()?;
     let mut fresh: Table<T> = Table::open(&tmp, max_segment_bytes)?;
     for slice in slices {
@@ -363,7 +483,7 @@ pub fn rewrite_table<T: Serialize + DeserializeOwned>(
         }
     }
     fresh.sync()?;
-    let new_chain_head = fresh.chain_head();
+    let new_root = fresh.root();
     let records = fresh.record_count();
 
     // close both tables before touching their directories
@@ -373,8 +493,8 @@ pub fn rewrite_table<T: Serialize + DeserializeOwned>(
     std::fs::rename(&tmp, dir)?;
     std::fs::remove_dir_all(&backup)?;
     Ok(RewriteStats {
-        old_chain_head,
-        new_chain_head,
+        old_root,
+        new_root,
         records,
     })
 }
@@ -777,6 +897,84 @@ mod tests {
             scan.segments_opened() < total_segments,
             "pruning opened all {total_segments} segments"
         );
+    }
+
+    #[test]
+    fn verify_passes_and_root_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root;
+        {
+            let mut t: Table<Row> = Table::open(dir.path(), 256).unwrap();
+            fill(&mut t, 40);
+            root = t.verify().unwrap();
+            assert_eq!(t.spine_size(), 40);
+        }
+        let mut t2: Table<Row> = Table::open(dir.path(), 256).unwrap();
+        assert_eq!(t2.spine_size(), 40);
+        assert_eq!(t2.root(), root);
+        assert_eq!(t2.verify().unwrap(), root);
+    }
+
+    /// A crash after a segment append but before the spine append leaves the
+    /// spine one or more leaves behind; reopen must re-derive them.
+    #[test]
+    fn reconcile_repairs_a_spine_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let root;
+        {
+            let mut t: Table<Row> = Table::open(dir.path(), 4096).unwrap();
+            fill(&mut t, 25);
+            root = t.root();
+        }
+        // simulate the crash: drop the last 2 leaf entries (64 bytes) from the
+        // spine, as if those appends never reached it
+        let spine = dir.path().join("merkle.spine");
+        let len = std::fs::metadata(&spine).unwrap().len();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&spine)
+            .unwrap();
+        f.set_len(len - 64).unwrap();
+        drop(f);
+
+        let mut t: Table<Row> = Table::open(dir.path(), 4096).unwrap();
+        assert_eq!(t.spine_size(), 25, "spine re-derived from the segments");
+        assert_eq!(t.root(), root);
+        assert_eq!(t.verify().unwrap(), root);
+    }
+
+    /// A crash that loses a torn segment tail can leave the spine ahead of the
+    /// durable records; reopen must truncate it back to match.
+    #[test]
+    fn reconcile_truncates_a_spine_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut t: Table<Row> = Table::open(dir.path(), 4096).unwrap();
+            fill(&mut t, 25);
+        }
+        // shrink the (single) segment by one whole record's worth of bytes so
+        // skim drops it, while the spine still holds its leaf
+        let seg = dir.path().join("seg-0000000000.log");
+        let len = std::fs::metadata(&seg).unwrap().len();
+        let row_bytes = (crate::storage::segment::FRAME_HEADER as u64)
+            + bincode::serialize(&Row {
+                ts: 0,
+                msg: "row-24".into(),
+            })
+            .unwrap()
+            .len() as u64;
+        let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+        f.set_len(len - row_bytes).unwrap();
+        drop(f);
+
+        let mut t: Table<Row> = Table::open(dir.path(), 4096).unwrap();
+        assert_eq!(
+            t.spine_size(),
+            24,
+            "spine truncated to the surviving records"
+        );
+        assert_eq!(t.record_count(), 24);
+        t.verify().unwrap();
     }
 
     /// Retention can unlink a sealed segment between a snapshot and the scan

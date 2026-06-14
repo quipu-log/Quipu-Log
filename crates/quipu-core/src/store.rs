@@ -3,12 +3,14 @@ use crate::checkpoint::{Checkpoint, CheckpointLog};
 use crate::crypto::{self, KeyRing, KeyVersion, KEYLESS};
 use crate::error::{Error, Result};
 use crate::id::Uid;
+use crate::merkle::Hash;
+use crate::merkle_log::{ConsistencyProof, InclusionProof};
 use crate::model::{AuditLog, Content, StoredValue, TargetRelation, Value};
 use crate::query::{LogQuery, LogView, Order, QueryPage, TargetFilter, TargetSnapshot};
 use crate::registry::{EntityInput, FieldTokens, RegistryIndex, RegistryRecord, TypeRegistry};
 use crate::retention::RetentionPolicy;
 use crate::schema::{CustomColumnDef, FieldIndex, TypeSchema};
-use crate::storage::{rewrite_table, ChainHash, Position, PositionedScan, SegmentSlice, Table};
+use crate::storage::{rewrite_table, Position, PositionedScan, SegmentSlice, Table};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -138,16 +140,16 @@ enum MetaEvent {
 
 /// Domain separation for re-key event signatures — never confusable with a
 /// checkpoint signature made by the same key.
-const REKEY_SIGNING_DOMAIN: &[u8] = b"quipu-rekey-v1\0";
+const REKEY_SIGNING_DOMAIN: &[u8] = b"quipu-rekey-v2\0";
 
 /// The signed, persisted record of one [`AuditStore::rekey`] pass.
 ///
-/// Re-keying rewrites registry tables, which necessarily produces new hash
-/// chains — exactly what tampering looks like. This event is what makes the
-/// rewrite *audited* instead: it is appended to the (chained) meta table and
-/// signs the old-head → new-head transition of every rewritten registry with
-/// the active RSA key. [`AuditStore::verify_integrity`] then checks that each
-/// registry chain still contains the head the latest re-key event signed —
+/// Re-keying rewrites registry tables, which necessarily produces a fresh
+/// Merkle spine — exactly what tampering looks like. This event is what makes
+/// the rewrite *audited* instead: it is appended to the meta table and signs the
+/// old-root → new-root transition of every rewritten registry with the active
+/// RSA key. [`AuditStore::verify_integrity`] then checks that each registry's
+/// current tree is consistent with the root the latest re-key event signed —
 /// a registry rewritten outside this path contradicts the signature.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RekeyEvent {
@@ -165,16 +167,19 @@ pub struct RekeyEvent {
     pub signature: Vec<u8>,
 }
 
-/// One registry table rewritten by a re-key pass: the signed chain-head
+/// One registry table rewritten by a re-key pass: the signed Merkle-root
 /// transition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RekeyedTable {
     pub type_name: String,
+    /// Tree size of the rewritten registry (records carried over). The new root
+    /// is taken over exactly this many leaves, so verification proves the
+    /// post-rewrite root is a prefix of the (possibly extended) current tree.
     pub records: u64,
-    /// Hex chain head before the rewrite (the chain this event retires).
-    pub old_chain_head: String,
-    /// Hex chain head after the rewrite (the chain this event vouches for).
-    pub new_chain_head: String,
+    /// Hex Merkle root before the rewrite (the tree this event retires).
+    pub old_root: String,
+    /// Hex Merkle root after the rewrite (the tree this event vouches for).
+    pub new_root: String,
 }
 
 fn rekey_signing_bytes(
@@ -192,9 +197,9 @@ fn rekey_signing_bytes(
         out.extend_from_slice(t.type_name.as_bytes());
         out.push(0);
         out.extend_from_slice(&t.records.to_le_bytes());
-        out.extend_from_slice(t.old_chain_head.as_bytes());
+        out.extend_from_slice(t.old_root.as_bytes());
         out.push(0);
-        out.extend_from_slice(t.new_chain_head.as_bytes());
+        out.extend_from_slice(t.new_root.as_bytes());
         out.push(0);
     }
     out
@@ -701,8 +706,8 @@ impl AuditStore {
             tables.push(RekeyedTable {
                 type_name: name,
                 records: stats.records,
-                old_chain_head: crypto::hex(&stats.old_chain_head),
-                new_chain_head: crypto::hex(&stats.new_chain_head),
+                old_root: crypto::hex(&stats.old_root),
+                new_root: crypto::hex(&stats.new_root),
             });
         }
 
@@ -738,13 +743,16 @@ impl AuditStore {
         Ok(out)
     }
 
-    /// Verify every recorded re-key event's signature, and that each registry
-    /// chain still contains the head the *latest* re-key event signed for it
-    /// (later upserts extend the chain past it; a rewrite severs it). Older
-    /// events' heads were legitimately retired by the next re-key.
+    /// Verify every recorded re-key event's signature, and that each registry's
+    /// current tree is *consistent with* the root the latest re-key event signed
+    /// for it — i.e. that signed root (over `records` leaves) is a genuine prefix
+    /// of the registry's present tree (later upserts only append; a rewrite
+    /// outside an audited re-key would break the consistency proof). Older
+    /// events' roots were legitimately retired by the next re-key.
     fn verify_rekey_events(&mut self) -> Result<()> {
         let events = self.rekey_events()?;
-        let mut latest_heads: HashMap<String, ChainHash> = HashMap::new();
+        // type -> (signed tree size, signed root) from the latest event for it
+        let mut latest: HashMap<String, (u64, Hash)> = HashMap::new();
         for ev in &events {
             self.cfg
                 .keys
@@ -760,25 +768,41 @@ impl AuditStore {
                 )
                 .map_err(|e| Error::Crypto(format!("re-key event signature invalid: {e}")))?;
             for t in &ev.tables {
-                let head: ChainHash = crypto::hex_decode(&t.new_chain_head)
+                let root: Hash = crypto::hex_decode(&t.new_root)
                     .and_then(|v| v.try_into().ok())
                     .ok_or_else(|| Error::Corrupt {
                         segment: format!("meta (re-key event for '{}')", t.type_name),
                         offset: 0,
-                        reason: "malformed chain head in re-key event".into(),
+                        reason: "malformed merkle root in re-key event".into(),
                     })?;
-                latest_heads.insert(t.type_name.clone(), head);
+                latest.insert(t.type_name.clone(), (t.records, root));
             }
         }
-        for (name, head) in latest_heads {
+        for (name, (signed_size, signed_root)) in latest {
             let Some(reg) = self.registries.get_mut(&name) else {
                 continue; // type defined again later under a fresh table
             };
-            if !reg.contains_chain_value(&head)? {
+            let current_size = reg.spine_size();
+            let current_root = reg.root();
+            let consistent = if signed_size == current_size {
+                signed_root == current_root
+            } else if signed_size < current_size {
+                let proof = reg.prove_consistency(signed_size)?;
+                crate::merkle::verify_consistency(
+                    signed_size as usize,
+                    current_size as usize,
+                    &signed_root,
+                    &current_root,
+                    &proof.path,
+                )
+            } else {
+                false // current tree smaller than the signed one — records vanished
+            };
+            if !consistent {
                 return Err(Error::Corrupt {
                     segment: format!("registry/{name}"),
                     offset: 0,
-                    reason: "registry chain no longer contains the head signed by the latest \
+                    reason: "registry tree is not consistent with the root signed by the latest \
                              re-key event — the registry was rewritten outside an audited re-key"
                         .into(),
                 });
@@ -803,6 +827,54 @@ impl AuditStore {
         self.checkpoints.read_all()
     }
 
+    // ---- merkle proofs ----------------------------------------------------
+
+    /// Current Merkle root over the whole log history (every record ever
+    /// appended, retained or purged). This is the value a checkpoint signs and
+    /// an anchor exports — a third party verifies proofs against it.
+    pub fn merkle_root(&self) -> Hash {
+        self.logs.root()
+    }
+
+    /// Total number of log records ever appended — the current Merkle tree size.
+    /// Inclusion/consistency proofs are issued against this size.
+    pub fn tree_size(&self) -> u64 {
+        self.logs.spine_size()
+    }
+
+    /// Prove that the log with `log_id` is committed to the current Merkle root:
+    /// an O(log n) audit path a third party verifies with
+    /// [`crate::merkle::verify_inclusion`] against [`merkle_root`](Self::merkle_root),
+    /// without the rest of the log and without trusting the operator. Fails if
+    /// the record has been purged by retention (its payload is gone) or is not
+    /// found.
+    pub fn prove_inclusion(&mut self, log_id: Uid) -> Result<InclusionProof> {
+        let base = self.logs.purged_count();
+        let slices = self.logs.slices()?;
+        let mut offset = 0u64;
+        for slice in slices {
+            let mut reader = crate::storage::SegmentReader::open_bounded(&slice.path, slice.bound)?;
+            while let Some((_, payload)) = reader.next_record()? {
+                let log: AuditLog = bincode::deserialize(&payload)?;
+                if log.log_id == log_id {
+                    return self.logs.prove_inclusion(base + offset);
+                }
+                offset += 1;
+            }
+        }
+        Err(Error::NotFound(format!(
+            "log {log_id} not found among retained records — cannot prove inclusion"
+        )))
+    }
+
+    /// Prove that the log tree of size `first_size` is a prefix of the current
+    /// tree — i.e. the history between the two sizes is append-only, nothing was
+    /// edited or removed. Verified with [`crate::merkle::verify_consistency`].
+    /// `first_size` is typically a [`Checkpoint::tree_size`] an auditor holds.
+    pub fn prove_consistency(&mut self, first_size: u64) -> Result<ConsistencyProof> {
+        self.logs.prove_consistency(first_size)
+    }
+
     fn write_checkpoint(&mut self) -> Result<Option<Checkpoint>> {
         if !self.cfg.keys.can_sign() {
             return Ok(None);
@@ -816,7 +888,8 @@ impl AuditStore {
             crate::time::now_micros(),
             self.logs.active_seq(),
             self.logs.record_count(),
-            self.logs.chain_head(),
+            self.logs.spine_size(),
+            self.logs.root(),
         )?;
         self.checkpoints.append(&cp)?;
         if let Some(hook) = &self.cfg.anchor {
@@ -834,15 +907,34 @@ impl AuditStore {
         for cp in &cps {
             cp.verify(&self.cfg.keys)?;
         }
-        // only the latest head is matched against the chain: older heads may
-        // legitimately live in segments retention has unlinked, and every
-        // count-reducing operation writes a fresh checkpoint
-        if !self.logs.contains_chain_value(&latest.chain_head)? {
+        // The latest checkpoint's root must be a genuine prefix of the current
+        // Merkle tree: same size ⇒ identical root; smaller size ⇒ a consistency
+        // proof must verify. The spine is never purged, so the current tree is
+        // always an extension of any honest past checkpoint — a rewrite or a
+        // truncation of the newest records breaks this. Older checkpoints are
+        // implied by the latest (their roots are prefixes of it).
+        let current_size = self.logs.spine_size();
+        let current_root = self.logs.root();
+        let consistent = if latest.tree_size == current_size {
+            latest.merkle_root == current_root
+        } else if latest.tree_size < current_size {
+            let proof = self.logs.prove_consistency(latest.tree_size)?;
+            crate::merkle::verify_consistency(
+                latest.tree_size as usize,
+                current_size as usize,
+                &latest.merkle_root,
+                &current_root,
+                &proof.path,
+            )
+        } else {
+            false // current tree smaller than the checkpoint — records vanished
+        };
+        if !consistent {
             return Err(Error::Corrupt {
                 segment: self.checkpoints.path().display().to_string(),
                 offset: 0,
-                reason: "latest checkpoint's chain head is absent from the log chain — the \
-                         chain was rewritten or truncated after the checkpoint was signed"
+                reason: "latest checkpoint's merkle root is not consistent with the current \
+                         tree — the log was rewritten or truncated after the checkpoint was signed"
                     .into(),
             });
         }

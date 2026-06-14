@@ -7,12 +7,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use quipu_core::{
     Content, CustomColumnDef, EntityInput, LogQuery, LogView, QueryPage, TargetSnapshot,
-    TypeSchema, Value,
+    TypeSchema, Uid, Value,
 };
 use quipu_middleware::{
-    disk_usage, AccessQuery, AccessRecord, Action, AuditEvent, AuditHandle, DiskUsage,
-    HealthSnapshot, MetricsSnapshot, MiddlewareError, MultiCursor, Role, ShardRouter, TargetSpec,
-    VerifyReport,
+    disk_usage, AccessQuery, AccessRecord, Action, AuditEvent, AuditHandle, ConsistencyResponse,
+    DiskUsage, HealthSnapshot, InclusionResponse, MetricsSnapshot, MiddlewareError, MultiCursor,
+    Role, ShardRouter, TargetSpec, VerifyReport,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -491,6 +491,30 @@ impl AppState {
             Some(r) => aggregate_metrics(r.metrics().into_values()),
         }
     }
+
+    fn prove_inclusion_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        log_id: Uid,
+    ) -> Result<InclusionResponse, MiddlewareError> {
+        match &self.router {
+            None => self.handle.prove_inclusion(role, log_id),
+            Some(r) => r.prove_inclusion(role, tenant, log_id),
+        }
+    }
+
+    fn prove_consistency_op(
+        &self,
+        role: &Role,
+        tenant: Option<&str>,
+        first_size: u64,
+    ) -> Result<ConsistencyResponse, MiddlewareError> {
+        match &self.router {
+            None => self.handle.prove_consistency(role, first_size),
+            Some(r) => r.prove_consistency(role, tenant.unwrap_or_default(), first_size),
+        }
+    }
 }
 
 /// Sum a set of per-shard metrics snapshots into one store-wide snapshot. The
@@ -533,6 +557,8 @@ pub fn router(state: AppState) -> Router {
             get(entity_history),
         )
         .route("/v1/access/query", post(query_access))
+        .route("/v1/proof/inclusion/{log_id}", get(proof_inclusion))
+        .route("/v1/proof/consistency", get(proof_consistency))
         .route("/v1/admin/flush", post(admin_flush))
         .route("/v1/admin/redrive", post(admin_redrive))
         .route("/v1/admin/retention", post(admin_retention))
@@ -1143,6 +1169,82 @@ async fn query_access(
     let role = state.authorize(&headers, Action::Administer)?.role;
     let st = state.clone();
     Ok(Json(blocking(move || st.query_access_op(&role, q)).await?))
+}
+
+// ---- merkle proofs -------------------------------------------------------------
+
+/// Lowercase-hex a byte slice (proof fields go out as hex so the JSON stays
+/// inspectable and matches the hex roots an anchor exports).
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Inclusion proof for a log id: proves the record is committed to the current
+/// Merkle root, in O(log n), without the rest of the log. Requires the `query`
+/// grant. In sharded mode pass the tenant header so the owning shard is found.
+/// Response: `{ log_id, leaf_index, tree_size, leaf, audit_path: [..], merkle_root }`
+/// — verify it with the published RFC 6962 algorithm against `merkle_root`.
+async fn proof_inclusion(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(log_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let role = state.authorize(&headers, Action::Query)?.role;
+    // accept the decimal u128 form a query returns, or 32-char hex
+    let id = log_id
+        .parse::<u128>()
+        .ok()
+        .map(Uid)
+        .or_else(|| Uid::from_hex(&log_id))
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("'{log_id}' is not a valid log id"),
+        })?;
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
+    let r = blocking(move || st.prove_inclusion_op(&role, tenant.as_deref(), id)).await?;
+    Ok(Json(serde_json::json!({
+        "log_id": log_id,
+        "leaf_index": r.proof.leaf_index,
+        "tree_size": r.proof.tree_size,
+        "leaf": hex(&r.proof.leaf),
+        "audit_path": r.proof.path.iter().map(|h| hex(h)).collect::<Vec<_>>(),
+        "merkle_root": hex(&r.root),
+    })))
+}
+
+#[derive(Deserialize)]
+struct ConsistencyParams {
+    /// The earlier tree size to prove the current tree extends (typically a
+    /// checkpoint's `tree_size` an auditor holds).
+    from: u64,
+}
+
+/// Consistency proof from an earlier tree size (`?from=`) to the current tree:
+/// proves the history in between is append-only — nothing was edited or removed.
+/// Requires the `query` grant. In sharded mode the tenant header selects the
+/// shard (proofs are per-shard). Response:
+/// `{ first_size, second_size, proof: [..], merkle_root }`.
+async fn proof_consistency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ConsistencyParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let role = state.authorize(&headers, Action::Query)?.role;
+    let tenant = state.tenant(&headers);
+    let st = state.clone();
+    let from = params.from;
+    let r = blocking(move || st.prove_consistency_op(&role, tenant.as_deref(), from)).await?;
+    Ok(Json(serde_json::json!({
+        "first_size": r.proof.first_size,
+        "second_size": r.proof.second_size,
+        "proof": r.proof.path.iter().map(|h| hex(h)).collect::<Vec<_>>(),
+        "merkle_root": hex(&r.root),
+    })))
 }
 
 /// Export matching logs as newline-delimited JSON (`application/x-ndjson`) —

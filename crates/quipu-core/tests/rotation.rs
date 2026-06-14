@@ -207,8 +207,8 @@ fn rekey_rewraps_rsa_values_and_reindexes_their_tokens() {
         .unwrap();
     assert!(patient.records > 0);
     assert_ne!(
-        patient.old_chain_head, patient.new_chain_head,
-        "re-wrapped values must produce a chain transition"
+        patient.old_root, patient.new_root,
+        "re-wrapped values must produce a merkle-root transition"
     );
 
     // (c) the re-key itself passes integrity verification

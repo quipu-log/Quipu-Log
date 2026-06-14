@@ -37,6 +37,8 @@ pub use checkpoint::Checkpoint;
 pub use crypto::{KeyRing, KeyVersion, KEYLESS};
 pub use error::{Error, Result};
 pub use id::Uid;
+pub use merkle::Hash;
+pub use merkle_log::{ConsistencyProof, InclusionProof};
 pub use model::{AuditLog, Content, StoredValue, TargetRelation, Value, ValueKind};
 pub use query::{LogQuery, LogView, MatchMode, Order, QueryPage, TargetFilter, TargetSnapshot};
 pub use registry::{EntityInput, FieldTokens};

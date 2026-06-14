@@ -8,7 +8,7 @@
 //! consistent. Nothing inside one shard vouches for the *set* of shards.
 //!
 //! A [`GlobalCheckpoint`] closes that gap. It pins, under one signature, every
-//! shard's latest checkpoint head (chain head + record count) together with a
+//! shard's latest checkpoint head (Merkle root + tree size) together with a
 //! hash of the routing manifest, and is exported to the same external anchor a
 //! single store already uses. Later, [`verify_global`](super::ShardRouter::verify_global)
 //! recomputes the current heads and compares: a shard that went missing, went
@@ -18,10 +18,11 @@
 //! (ADR-2). Ordering across shards stays clock-based; this signature is purely
 //! cryptographic tamper-evidence over the shard set.
 //!
-//! **Caveat:** record counts shrink legitimately under retention, so a global
-//! checkpoint must be re-signed after a retention run on any shard (the same
-//! re-anchor discipline a single store follows). A stale anchor would read a
-//! retention drop as a rollback.
+//! Pinning the Merkle *tree size* (total records ever appended) rather than the
+//! live record count means retention no longer looks like a rollback: the tree
+//! size only ever grows, even as retention purges old segments. A rollback is a
+//! shard whose tree size went *down*, or whose root changed at an unchanged
+//! size — both genuine tampering.
 
 use super::shard_map::{ShardId, ShardMap};
 use quipu_core::{Error, KeyRing, Result as CoreResult};
@@ -29,16 +30,17 @@ use serde::{Deserialize, Serialize};
 
 /// Domain separation: a global-checkpoint signature must never be confusable
 /// with a per-shard [`quipu_core::Checkpoint`] signature made by the same key.
-const SIGNING_DOMAIN: &[u8] = b"quipu-global-checkpoint-v1\0";
+const SIGNING_DOMAIN: &[u8] = b"quipu-global-checkpoint-v2\0";
 
 /// One shard's pinned position inside a [`GlobalCheckpoint`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardHead {
     pub shard: ShardId,
-    /// Hex of the shard's chain head at anchor time.
-    pub chain_head_hex: String,
-    /// Records on the shard's chain at anchor time (drops only under retention).
-    pub record_count: u64,
+    /// Hex of the shard's Merkle root at anchor time.
+    pub merkle_root_hex: String,
+    /// Total records ever appended to the shard at anchor time — the Merkle tree
+    /// size. Monotonic: never decreases, even under retention.
+    pub tree_size: u64,
 }
 
 /// A signed pin over the whole sharded store: every shard's latest checkpoint
@@ -76,8 +78,8 @@ fn signing_bytes(signed_at: u64, manifest_hash: &str, heads: &[ShardHead]) -> Ve
     out.extend_from_slice(&(heads.len() as u32).to_le_bytes());
     for h in heads {
         out.extend_from_slice(&h.shard.0.to_le_bytes());
-        out.extend_from_slice(&h.record_count.to_le_bytes());
-        out.extend_from_slice(h.chain_head_hex.as_bytes());
+        out.extend_from_slice(&h.tree_size.to_le_bytes());
+        out.extend_from_slice(h.merkle_root_hex.as_bytes());
     }
     out
 }

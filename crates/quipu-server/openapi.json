@@ -133,6 +133,68 @@
   },
   "security": [{ "bearerAuth": [] }],
   "paths": {
+    "/v1/proof/inclusion/{log_id}": {
+      "get": {
+        "summary": "Merkle inclusion proof for one log",
+        "description": "Proves the log is committed to the current Merkle root with an O(log n) audit path, verifiable by a third party against the published root without the rest of the log. Requires the query grant. In sharded mode pass X-Tenant so the owning shard is found. log_id may be the decimal u128 or 32-char hex form.",
+        "parameters": [
+          { "name": "log_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Inclusion proof. Verify leaf at leaf_index in a tree of tree_size against merkle_root using the RFC 6962 algorithm.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "log_id": { "type": "string" },
+                    "leaf_index": { "type": "integer" },
+                    "tree_size": { "type": "integer" },
+                    "leaf": { "type": "string", "description": "hex SHA-256 leaf hash" },
+                    "audit_path": { "type": "array", "items": { "type": "string" }, "description": "hex sibling hashes, leaf to root" },
+                    "merkle_root": { "type": "string", "description": "hex Merkle root the proof verifies against" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Malformed log id." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "description": "Log not found among retained records (purged or unknown)." }
+        }
+      }
+    },
+    "/v1/proof/consistency": {
+      "get": {
+        "summary": "Merkle consistency proof between two tree sizes",
+        "description": "Proves the log tree of size `from` is a prefix of the current tree — the history in between is append-only, nothing edited or removed. Verifiable with the RFC 6962 consistency algorithm. `from` is typically a checkpoint's tree_size held by an auditor. Requires the query grant. In sharded mode X-Tenant selects the shard (proofs are per-shard).",
+        "parameters": [
+          { "name": "from", "in": "query", "required": true, "schema": { "type": "integer" }, "description": "earlier tree size" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Consistency proof from first_size to second_size, verifiable against merkle_root.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "first_size": { "type": "integer" },
+                    "second_size": { "type": "integer" },
+                    "proof": { "type": "array", "items": { "type": "string" }, "description": "hex proof node hashes" },
+                    "merkle_root": { "type": "string", "description": "hex current Merkle root" }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
     "/v1/healthz": {
       "get": {
         "summary": "Liveness check",

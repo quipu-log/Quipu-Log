@@ -128,7 +128,7 @@ Routine rotation (no compromise) ends there: old records keep working, new write
 4. Check the printed summary, then **destroy the old RSA private key** — it can no longer decrypt anything in the store. Keep old HMAC keys and old public keys.
 5. Restart.
 
-Re-key rewrites registry tables, which produces new hash chains — exactly what tampering looks like. So the pass appends a **signed re-key event** to the chained meta table, recording each registry's old-head → new-head transition. `verify_integrity()` checks every re-key signature and that each chain still contains the head the latest event signed, so an audited re-key stays distinguishable from a silent rewrite.
+Re-key rewrites registry tables, which produces a fresh Merkle tree — exactly what tampering looks like. So the pass appends a **signed re-key event** to the meta table, recording each registry's old-root → new-root transition. `verify_integrity()` checks every re-key signature and that each registry's current tree is consistent with the root the latest event signed (a consistency proof), so an audited re-key stays distinguishable from a silent rewrite.
 
 Two limits. HMAC fields are one-way with no plaintext on disk, so they **can't** be re-keyed: keep their old HMAC keys for search, and know that a leaked HMAC key has permanently exposed the digests written under it. And re-key covers the registries, not log rows — `method`/`url`/`content` are plaintext by design and have no keys to rotate.
 
@@ -177,6 +177,8 @@ The full machine-readable contract is served at **`GET /v1/openapi.json`** (Open
 | `POST /v1/logs/export` | query | `LogQuery` JSON → `application/x-ndjson` (one `LogView` per line) |
 | `GET /v1/entities/{type}?include_deleted=` | query | `[TargetSnapshot]` (latest versions) |
 | `GET /v1/entities/{type}/{id}/history` | query | `[TargetSnapshot]` (oldest first) |
+| `GET /v1/proof/inclusion/{log_id}` | query | Merkle inclusion proof → `{leaf_index, tree_size, leaf, audit_path[], merkle_root}` (hex). 404 if purged/unknown. Per-shard via tenant header. |
+| `GET /v1/proof/consistency?from=` | query | Merkle consistency proof from size `from` to now → `{first_size, second_size, proof[], merkle_root}` (hex). |
 | `POST /v1/access/query` | administer | `AccessQuery` JSON (`from_micros`/`to_micros`/`actor`/`operation`/`limit`, all optional) → `[AccessRecord]`. Meta-audit: who queried/administered the store. Needs `store.access_log: true` (400 otherwise). Each read is itself recorded, exactly once. |
 | `POST /v1/admin/flush` | administer | fsync everything queued → 204 |
 | `POST /v1/admin/redrive` | administer | `{"redriven": n, "requeued": n, "quarantined_entries": n, "quarantined_segments": n}` — corrupt DLQ material is moved to `<dlq>.quarantine/` instead of failing the redrive |
@@ -279,7 +281,7 @@ Same rule as embedded `define_type`: redefinition is additive only.
 
 ## Integrity verification
 
-Every table is a hash chain (`sha256(previous chain value || payload)`, seeded across segment boundaries), so in-place edits and removed or replaced segments are detectable after the fact. The embedded API has `AuditStore::verify_integrity()`; the server exposes the same check two ways.
+Every table is committed to an RFC 6962 Merkle history tree (leaf `sha256(0x00 || payload)`, kept in a retention-independent spine), so in-place edits and removed or replaced segments are detectable after the fact. The embedded API has `AuditStore::verify_integrity()`; the server exposes the same check two ways.
 
 **On demand** — `POST /v1/admin/verify` (administer):
 
@@ -297,7 +299,23 @@ curl -s -X POST localhost:7700/v1/admin/verify \
 }
 ```
 
-A found chain break is a *successful* verification: still 200, with `"ok": false` and the break described in `problems` (verification stops at the first break, so it lists at most one). Only "could not verify at all" is an error status.
+A found break is a *successful* verification: still 200, with `"ok": false` and the break described in `problems` (verification stops at the first break, so it lists at most one). Only "could not verify at all" is an error status.
+
+### Third-party Merkle proofs
+
+`verify` is the *operator's* self-check. The proof endpoints let **anyone** confirm a record's place against a signed root — without the rest of the log and without trusting the daemon. Both need the `query` grant; in sharded mode pass the tenant header so the right shard answers (proofs are per-shard).
+
+- `GET /v1/proof/inclusion/{log_id}` — proves the log is committed to the current root. Returns `leaf_index`, `tree_size`, `leaf`, `audit_path[]`, `merkle_root` (all hashes hex). Verify with the RFC 6962 inclusion algorithm. 404 if the record was purged by retention or is unknown.
+- `GET /v1/proof/consistency?from=<size>` — proves the tree of size `from` is a prefix of the current tree (append-only). Returns `first_size`, `second_size`, `proof[]`, `merkle_root`. `from` is typically a checkpoint's `tree_size` an auditor anchored earlier.
+
+```sh
+curl -s localhost:7700/v1/proof/inclusion/0190e8b2c3d4... \
+  -H 'Authorization: Bearer reader-t0ken'
+curl -s 'localhost:7700/v1/proof/consistency?from=1000' \
+  -H 'Authorization: Bearer reader-t0ken'
+```
+
+`log_id` is the value from a query result (`LogView.log_id`, a 32-char hex string); the decimal form is also accepted.
 
 **Periodic** — add a `verify` section to the config:
 
@@ -367,7 +385,7 @@ The matching *prevention* knob is `retention_max_bytes`: give the store a byte b
 
 ## Availability and recovery
 
-The daemon is a single process by design (see the [root README's scope section](../../README.md#why-no-distributed-storage)): one writer is what keeps the store to one file lock and one unbroken hash chain. That makes the daemon a single point of availability — while it's down, callers' audit trails stall — so the project solves availability at the *client*, not by replicating the chain.
+The daemon is a single process by design (see the [root README's scope section](../../README.md#scaling-out-sharded-trees-not-a-distributed-tree)): one writer is what keeps the store to one file lock and one append-only Merkle tree per table. That makes the daemon a single point of availability — while it's down, callers' audit trails stall — so the project solves availability at the *client*, not by replicating the tree.
 
 ### Idempotent appends
 
@@ -386,7 +404,7 @@ The window is in memory by design. A retransmission that straddles a server rest
 
 ### Cold-standby failover
 
-Recover from a failed or stopped node by cold standby, not live failover. There's no second writer to fail over *to* — that's the point of the single-chain design.
+Recover from a failed or stopped node by cold standby, not live failover. There's no second writer to fail over *to* — that's the point of the single-writer design.
 
 1. **Quiesce the active node** if it's still up: send `SIGINT`/`SIGTERM` for a clean shutdown (final fsync), or call `POST /v1/admin/flush` to push the active segment and registry tail to disk. Sealed segments are already immutable and safe to copy anytime; this step only settles the *active* tail.
 2. **Copy the store root** to the standby host (`rsync`, snapshot, or restore from backup — see the root README's export/backup notes). Because sealed segments never change, an incremental copy only moves the active tail.

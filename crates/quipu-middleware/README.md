@@ -62,7 +62,7 @@ A `FilterSet` runs your code around the audited request:
 
 ## Sharding
 
-One pipeline is one writer thread on one store — the invariant that keeps the hash chain a single unbroken line. To scale past that ceiling without breaking it, `ShardRouter` fronts **N independent pipelines**, each a complete single-writer chain + registry + checkpoints:
+One pipeline is one writer thread on one store — the invariant that keeps each Merkle tree a single append-only line. To scale past that ceiling without breaking it, `ShardRouter` fronts **N independent pipelines**, each a complete single-writer tree + registry + checkpoints:
 
 ```rust,no_run
 use quipu_middleware::{ShardMap, ShardRouter};
@@ -82,10 +82,10 @@ let page = router.query_page(&role, Some("tenant-acme"), q, None, 100)?;
 
 Key properties (full model in [`docs/specs/horizontal-scaling`](../../docs/specs/horizontal-scaling/solution-design.md)):
 
-- **Routing is consistent-hash by tenant.** A tenant's writes always land on one shard, so its chain never forks across shards.
+- **Routing is consistent-hash by tenant.** A tenant's writes always land on one shard, so its tree never forks across shards.
 - **No global order.** Cross-shard reads merge by `(timestamp_micros, log_id)`. An audit log rarely needs a single global sequence; per-shard order plus per-shard signed checkpoints is enough. Keep clocks sane (NTP).
-- **Resharding is add-only.** Chains can't be rebalanced, so growth `freeze`s existing shards (read-only, still single-writer forever) and routes new writes to new shards. A tenant's history then spans its frozen and active shards; tenant-scoped reads cover both automatically.
-- **Cross-shard integrity.** Per-shard `verify` catches tampering *within* a shard; `GlobalCheckpoint` / `verify_global` pin every shard's checkpoint head plus the shard-map manifest under one signature, catching attacks on the shard *set* — whole-shard deletion, rollback, manifest tampering. Re-anchor after a shard's retention run (a legitimately reduced record count otherwise looks like a rollback).
+- **Resharding is add-only.** Trees can't be rebalanced, so growth `freeze`s existing shards (read-only, still single-writer forever) and routes new writes to new shards. A tenant's history then spans its frozen and active shards; tenant-scoped reads cover both automatically.
+- **Cross-shard integrity.** Per-shard `verify` catches tampering *within* a shard; `GlobalCheckpoint` / `verify_global` pin every shard's Merkle root + tree size plus the shard-map manifest under one signature, catching attacks on the shard *set* — whole-shard deletion, rollback (a smaller tree size), a rewrite (root changed at the same size), or manifest tampering. The tree size is monotonic, so a retention run no longer looks like a rollback.
 
 `quipu-server` switches to the router automatically when its config has a `[shards]` section; single-store mode stays byte- and wire-compatible. See the [quipu-server README](../quipu-server/README.md).
 

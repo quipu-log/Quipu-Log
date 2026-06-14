@@ -6,7 +6,7 @@ Reference client for [`quipu-server`](../quipu-server/README.md). It's the proto
 
 ## Why a client crate at all
 
-`quipu-server` is one process by design. A file lock keeps its hash-chained store to a single writer, which is what makes the tamper-evidence simple to reason about (see the [root README's scope section](../../README.md#why-no-distributed-storage)).
+`quipu-server` is one process by design. A file lock keeps its Merkle-committed store to a single writer, which is what makes the tamper-evidence simple to reason about (see the [root README's scope section](../../README.md#scaling-out-sharded-trees-not-a-distributed-tree)).
 
 The cost is a single point of availability. While the daemon is down or its write queue is full, a naïve caller's audit trail just stops. For audit logs, that's a compliance hole, not a transient glitch.
 

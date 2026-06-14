@@ -78,8 +78,8 @@ pub use layer::{ActorExtractor, AuditLayer, AuditService, EndpointRule, TargetEx
 pub use metrics::{LatencySnapshot, MetricsSnapshot, PipelineMetrics};
 pub use permissions::{Action, PermissionPolicy, Role};
 pub use pipeline::{
-    AuditHandle, AuditPipeline, DlqEntry, FallbackFn, MiddlewareError, PipelineConfig,
-    RedriveReport, SinkFn, VerifyReport,
+    AuditHandle, AuditPipeline, ConsistencyResponse, DlqEntry, FallbackFn, InclusionResponse,
+    MiddlewareError, PipelineConfig, RedriveReport, SinkFn, VerifyReport,
 };
 pub use quipu_core::{AccessQuery, AccessRecord};
 pub use sharding::{

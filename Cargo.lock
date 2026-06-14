@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "axum-demo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "quipu-core",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "quipu-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "quipu-core",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "quipu-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "quipu-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand",
  "serde",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "quipu-middleware"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "quipu-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "axum-server",

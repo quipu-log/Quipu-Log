@@ -210,6 +210,7 @@ pub struct TargetSnapshot {
 /// A fully resolved query hit: the raw log row plus actor/target snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogView {
+    #[serde(with = "crate::id::hex_serde")]
     pub log_id: Uid,
     pub timestamp_micros: u64,
     /// RFC 3339, always UTC+0.

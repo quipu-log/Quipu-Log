@@ -15,7 +15,7 @@ readme = "README.md"
 all-features = true
 
 [dependencies]
-quipu-core = { path = "../quipu-core", version = "0.1.0" }
+quipu-core = { path = "../quipu-core", version = "0.2.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crc32fast = { workspace = true }

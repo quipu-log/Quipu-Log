@@ -40,6 +40,39 @@ change and gets a major-version bump with a changelog note.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-14
+
+### Changed (breaking)
+- **Integrity is now an RFC 6962 Merkle history tree, not a per-record hash
+  chain.** The single chain is replaced by a retention-independent Merkle spine
+  (`merkle.spine` per table) whose root commits to every record ever appended.
+  This subsumes the chain's tamper-evidence (in-place edits and segment
+  reordering still change the root) and adds **independent third-party
+  verification**: anyone can verify a record's inclusion or the append-only
+  consistency of the log against an anchored root, in O(log n), without holding
+  the whole log or trusting the operator.
+- **On-disk segment format v2 (incompatible, no migration tool).** The header
+  drops the 32-byte chain seed and now carries an 8-byte `base_index`; frames
+  drop the 32-byte per-record chain hash (`[len][crc][ts][payload]`). v1 stores
+  cannot be read by v2 — re-export under v2. (Pre-1.0, not yet in production
+  use, so this is a hard break by design.)
+- **Checkpoints** pin the Merkle root + tree size (domain `quipu-checkpoint-v2`)
+  instead of a chain head; verification uses a consistency proof against the
+  current tree. Re-key events sign the root transition (domain `quipu-rekey-v2`)
+  and verify by consistency proof. Cross-shard `GlobalCheckpoint` pins each
+  shard's root + tree size (tree size is monotonic, so retention no longer reads
+  as a rollback); domain `quipu-global-checkpoint-v2`.
+- `LogView.log_id` now serializes on the wire as a 32-char hex string (it is a
+  128-bit id; JSON number encoders silently round it through `f64`, which is
+  lossy — the hex form round-trips, so a client can ask for a record's proof).
+  Storage (bincode) is unchanged.
+
+### Added
+- Merkle proof API. Core: `AuditStore::prove_inclusion(log_id)`,
+  `prove_consistency(first_size)`, `merkle_root()`, `tree_size()`. HTTP:
+  `GET /v1/proof/inclusion/{log_id}` and `GET /v1/proof/consistency?from=`
+  (query grant; per-shard in sharded mode, selected by the tenant header).
+
 ## [0.1.0] - 2026-06-14
 
 Initial public release — all five crates published to crates.io.

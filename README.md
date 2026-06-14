@@ -12,7 +12,7 @@ English | [한국어](README.ko.md)
 
 Quipu-Log answers questions like: *who changed this document last quarter, and what was it called back then?*
 
-It logs who did what, to which entity, through which API. Each record is hash-chained to the one before it, so a silent edit shows up. And it stores what every entity looked like the moment you wrote the log. Rename a user today, and last month's logs still show — and still find — the old name.
+It logs who did what, to which entity, through which API. Every record is committed to a Merkle history tree, so a silent edit shows up — and a third party can prove a record's presence or the log's append-only history against a signed root. And it stores what every entity looked like the moment you wrote the log. Rename a user today, and last month's logs still show — and still find — the old name.
 
 ## Why it exists
 
@@ -26,7 +26,7 @@ Moving the logs into a database table fixes the third. The first two remain.
 
 Quipu-Log treats all three as design requirements:
 
-- **Tampering shows.** Storage is append-only. Every record carries a SHA-256 hash chained to the previous one, across file boundaries. `store.verify_integrity()` finds the first record edited in place, or the segment swapped out. A patched-up CRC won't hide it.
+- **Tampering shows — and anyone can check.** Storage is append-only, committed to an RFC 6962 Merkle history tree. `store.verify_integrity()` finds a record edited in place or a segment swapped out, and a patched-up CRC won't hide it. Beyond that, a third party can verify a record's **inclusion**, or that history stayed **append-only** (consistency), in O(log n) against a signed root — without the whole log and without trusting the operator.
 - **History keeps its context.** People and things are stored as versioned entities. Old logs render and match the values that were true when they were written.
 - **No database to run — but key state to manage.** The store is a directory, managed with plain `std::fs`. No daemon, no external dependency, and a crash recovers by truncating the torn tail, the same way on every OS. What you *do* take on is keys: protect a field and you own its encryption keys, where a lost key means logs you can't read. That's the real operational cost here — see [Key management](#key-management).
 - **Writes don't block your handler.** Events go through an async pipeline: retries, a disk-backed dead-letter queue, and a fallback hook you can wire to your pager.
@@ -42,7 +42,7 @@ A registry never overwrites. Change an entity's fields, and the registry appends
 That pinning is what makes time-travel queries work. Old and new values both stay indexed, and each log shows the values it actually saw.
 
 ```
-your handler ──emit──▶ pipeline ─────────▶ store (append-only, hash-chained)
+your handler ──emit──▶ pipeline ─────────▶ store (append-only, Merkle-committed)
               (non-    (queue, retries,     ├── logs
               blocking) DLQ, fallback)      └── registries (versioned entities)
 ```
@@ -241,7 +241,7 @@ Each record holds the actor (in server mode, the token's role), the operation, a
 - **No self-reference loop.** Recording an access is a plain append — it runs no query, so it can't spawn another access record. Reading the access log is recorded too (it's also an access), but exactly once per read. Growth is linear, never recursive.
 - **Search terms stay out.** The parameter summary keeps the *shape* of a query — which fields, which match mode, what time range — but never the term values. Otherwise, searching an HMAC- or RSA-protected field would leak its plaintext into the access log and defeat the field protection.
 
-Access records live in their own table (`root/access/`), with their own tamper-evidence chain, covered by `verify_integrity`. They also get their own retention window, so access records — usually kept shorter than the data they describe — age out on their own schedule without touching the main log.
+Access records live in their own table (`root/access/`), with their own Merkle spine, covered by `verify_integrity`. They also get their own retention window, so access records — usually kept shorter than the data they describe — age out on their own schedule without touching the main log.
 
 To read them back: embedded, `handle.query_access(&admin_role, AccessQuery::default())`; in server mode, `POST /v1/access/query` with the `administer` grant.
 
@@ -249,35 +249,37 @@ To read them back: embedded, `handle.query_access(&admin_role, AccessQuery::defa
 
 Quipu-Log makes tampering *evident*; it does not make storage *immutable*. Knowing exactly where that line falls is the difference between a guarantee you have and one you only think you have.
 
-The hash chain **on its own** catches:
+The Merkle tree **on its own** catches:
 
 - **Accidental corruption** — a torn write, bit rot, a truncated tail.
-- **Naive tampering** — a record edited in place, or a whole segment swapped out. `verify_integrity()` reports the first break.
+- **Naive tampering** — a record edited in place, or a whole segment swapped out. `verify_integrity()` reports the first break, since the record no longer hashes to its committed leaf.
 
-The hash chain on its own does **not** catch:
+It also lets a **third party verify, independently**: an inclusion proof shows a record is in the log; a consistency proof shows the history stayed append-only — both O(log n), both checkable against a published root without the rest of the log or any trust in the operator.
 
-- **Truncation.** Delete the most recent records, or the whole active segment, and what remains still verifies end to end — it just ends sooner. Nothing inside the chain says how long it was supposed to be.
-- **Full recomputation.** An attacker with write access to the store *and* knowledge of the format can edit a record and recompute every hash from that point on. The chain is unsalted SHA-256, so a rebuilt chain verifies clean.
+The tree on its own does **not** catch:
 
-What closes those two gaps is **signed checkpoints plus external anchoring**. Quipu-Log periodically signs the current chain head; you export that signature somewhere the writer can't reach. A later verification matches the live chain against the anchored checkpoints, so a shortened or rebuilt chain no longer agrees with a signature taken when the log was longer.
+- **Truncation.** Delete the most recent records, or the whole active segment, and what remains still verifies — it just ends sooner. Nothing inside the store says how long it was supposed to be.
+- **Full recomputation.** An attacker with write access to the store *and* knowledge of the format can delete the spine and segments and rebuild a self-consistent tree from scratch. The leaves are unsalted SHA-256, so a rebuilt tree verifies clean.
+
+What closes those two gaps is **signed checkpoints plus external anchoring**. Quipu-Log periodically signs the current Merkle root and tree size; you export that signature somewhere the writer can't reach. A later verification matches the live tree against the anchored checkpoints (root equality, or a consistency proof), so a shortened or rebuilt tree no longer agrees with a signature taken when the log was longer.
 
 That guarantee holds only under two conditions — both your deployment's job, not the library's:
 
 - **The anchor must leave the box.** A checkpoint signature sitting next to the data it protects gets rewritten alongside it. Send it elsewhere: another host, an append-only bucket, a timestamping or transparency service.
-- **The signing key must not live with the data.** Anyone holding the checkpoint key can re-sign a rewritten chain. Anchoring stops an outside attacker and a disk-level actor; it stops a key-holding insider only if the key sits somewhere they don't control — see [Key management](#key-management).
+- **The signing key must not live with the data.** Anyone holding the checkpoint key can re-sign a rewritten tree. Anchoring stops an outside attacker and a disk-level actor; it stops a key-holding insider only if the key sits somewhere they don't control — see [Key management](#key-management).
 
 The full scope — what's defended, what's deliberately out, what counts as a vulnerability — is in [SECURITY.md](SECURITY.md).
 
-## Scaling out: sharded chains, not a distributed chain
+## Scaling out: sharded trees, not a distributed tree
 
-There is one thing Quipu-Log won't do: spread a **single** hash chain across machines. Every record is chained to the one before it in a single line, and that line only holds if one writer owns it. Put one chain behind multiple writers and it forks; reconciling the forks needs consensus between nodes, and one bug in that consensus turns "this log wasn't altered" into "probably wasn't." That trade — availability bought with the project's whole reason to exist — is the one we refuse.
+There is one thing Quipu-Log won't do: spread a **single** Merkle tree across machines. Each tree is appended to in one line, and that holds only if one writer owns it. Put one tree behind multiple writers and it forks; reconciling the forks needs consensus between nodes, and one bug in that consensus turns "this log wasn't altered" into "probably wasn't." That trade — availability bought with the project's whole reason to exist — is the one we refuse.
 
-But "no distributed chain" is not "no horizontal scaling." The invariant that matters is **one writer per chain**, not **one chain total**. Keep that, and you scale on both axes:
+But "no distributed tree" is not "no horizontal scaling." The invariant that matters is **one writer per tree**, not **one tree total**. Keep that, and you scale on both axes:
 
-- **Writes scale by sharding.** Partition the audit stream by tenant; each shard is an independent single-writer chain + registry + checkpoints — today's exact per-node guarantee, N times over. N shards = N writer threads ≈ N× write throughput. What you give up is a single global order across shards; an audit log rarely needs one (per-shard order + per-shard signed checkpoints is enough). `quipu-middleware`'s `ShardRouter` routes a tenant's writes to its owning shard and fans queries out, merging by timestamp.
+- **Writes scale by sharding.** Partition the audit stream by tenant; each shard is an independent single-writer tree + registry + checkpoints — today's exact per-node guarantee, N times over. N shards = N writer threads ≈ N× write throughput. What you give up is a single global order across shards; an audit log rarely needs one (per-shard order + per-shard signed checkpoints, cross-anchored by a `GlobalCheckpoint`, is enough). `quipu-middleware`'s `ShardRouter` routes a tenant's writes to its owning shard and fans queries out, merging by timestamp.
 - **Reads scale by replication.** Sealed segments are immutable, so they copy to any number of read-replica query nodes with no effect on integrity — only the active tail lags. That lifts the single-process read ceiling.
-- **Acceptance scales statelessly.** A stateless ingest front behind a load balancer takes requests and routes them to the owning shard by `Idempotency-Key` (already implemented) — request intake scales horizontally while each chain keeps its single writer.
-- **Resharding is add-only.** Chains are append-only and can't be rebalanced, so growth freezes existing shards (read-only, forever single-writer) and routes new writes to new shards via consistent hashing. No record ever moves; a tenant's history simply spans its old (frozen) and current (active) shards, and reads cover both.
+- **Acceptance scales statelessly.** A stateless ingest front behind a load balancer takes requests and routes them to the owning shard by `Idempotency-Key` (already implemented) — request intake scales horizontally while each tree keeps its single writer.
+- **Resharding is add-only.** Trees are append-only and can't be rebalanced, so growth freezes existing shards (read-only, forever single-writer) and routes new writes to new shards via consistent hashing. No record ever moves; a tenant's history simply spans its old (frozen) and current (active) shards, and reads cover both.
 
 The full model — shard key, ordering, resharding, read topology — is in [`docs/specs/horizontal-scaling`](docs/specs/horizontal-scaling/solution-design.md).
 
@@ -311,7 +313,7 @@ Step-by-step rotation and re-key procedures: [quipu-server README](crates/quipu-
 - **Retention** — `RetentionPolicy::days(90)` drops old data by deleting whole sealed segments: one `unlink`, no rewrites. Registries are kept, so old history still renders. Add `.with_max_bytes(n)` for a size cap; age and size combine as OR, and the active segment is never dropped, so the cap is a target, not a hard ceiling. Integrity still verifies afterward.
 - **Durability** — `SyncPolicy::Always` (fsync every write), `EveryN(n)`, or `OsManaged`.
 - **Dead-letter queue** — events that exhaust their retries are parked on disk, survive restarts, and replay with `handle.redrive_dlq(&admin_role)`. Redrive is crash-safe and at-least-once; replayed logs keep their original occurrence time.
-- **Integrity audit** — `store.verify_integrity()` walks every hash chain and reports the first record edited in place or segment swapped out.
+- **Integrity audit** — `store.verify_integrity()` checks every record against its Merkle tree and reports the first record edited in place or segment swapped out; `prove_inclusion` / `prove_consistency` issue proofs a third party can check.
 - **Key rotation** — keys in the `KeyRing` are versioned; the highest version is active, older ones stay for reading, so rotating never drops old records from search. Routine rotation just adds a higher version. After a key leak, an offline `rekey` pass re-wraps RSA data under the new key — the leaked key can no longer read the store — and appends a signed re-key event so `verify_integrity()` tells an audited re-key from a silent rewrite. (HMAC fields are one-way and can't be re-keyed, so keep old HMAC keys.) Full procedure: [quipu-server README](crates/quipu-server/README.md#key-rotation).
 - **Backup** — sealed segments are immutable, so `rsync` or a snapshot copies them safely while the daemon runs. `flush` first to settle the active tail for a clean point-in-time copy, then verify the restored copy with `verify_integrity()`.
 - **Disk-full** — defined behavior, not luck. Housekeeping warns early (below 1 GiB or 10% free, configurable). An ENOSPC write skips retries and routes straight to DLQ/fallback, and sets a disk-full latch that clears when a write succeeds or space recovers.
@@ -344,10 +346,10 @@ The p50 is just a bounded-channel enqueue — the audited request path normally 
 
 Those are throughput figures, not capacity. Two ceilings matter as data accumulates:
 
-- **One writer, one process.** A single thread owns the store — that's what keeps the hash chain a single unbroken line ([why](#scaling-out-sharded-chains-not-a-distributed-chain)). The numbers above are that thread's ceiling; you scale a node by batching and queue sizing, not by adding writers, and past one node you shard by tenant, not replicate. Plan capacity around a sustained single-writer rate, with retention bounding how much history a node carries.
+- **One writer, one process.** A single thread owns the store — that's what keeps each Merkle tree a single append-only line ([why](#scaling-out-sharded-trees-not-a-distributed-tree)). The numbers above are that thread's ceiling; you scale a node by batching and queue sizing, not by adding writers, and past one node you shard by tenant, not replicate. Plan capacity around a sustained single-writer rate, with retention bounding how much history a node carries.
 - **Queries full-scan; the registry index is in memory.** A query scans log segments, and the registry's entity indexes live in RAM (a snapshot clones them, off the write path). Comfortable for millions of records; at hundreds of millions a full-scan query is seconds rather than milliseconds, and the in-memory indexes grow with your distinct-entity count, so the working set has to fit. Keep it bounded: lean on retention, always constrain queries by time range, and add a blind index only on fields you actually search. There's no secondary index over log rows yet — for ad-hoc analytics at that scale, export ([`POST /v1/logs/export`](#operational-notes)) into a dedicated search or warehouse system rather than scanning live.
 
-Robustness gets its own tests: `fuzz/` has libFuzzer targets for the segment parser and DLQ redrive, and `crates/quipu-middleware/tests/` has a concurrent stress test (emit + flush + retention + query, full chain verification after) and a SIGKILL crash-injection test. Every PR runs a short fuzz smoke; long runs happen in nightly CI.
+Robustness gets its own tests: `fuzz/` has libFuzzer targets for the segment parser and DLQ redrive, and `crates/quipu-middleware/tests/` has a concurrent stress test (emit + flush + retention + query, full Merkle verification after) and a SIGKILL crash-injection test. Every PR runs a short fuzz smoke; long runs happen in nightly CI.
 
 ## Workspace layout
 

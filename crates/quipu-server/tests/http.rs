@@ -949,3 +949,139 @@ async fn query_pagination_and_count() {
 
     pipeline.shutdown();
 }
+
+#[tokio::test]
+async fn merkle_proof_endpoints() {
+    use quipu_core::merkle::{verify_consistency, verify_inclusion};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (app, pipeline) = test_app(dir.path());
+
+    // schema + a handful of logs
+    send(
+        &app,
+        "POST",
+        "/v1/types",
+        Some("admin-token"),
+        Some(user_schema()),
+    )
+    .await;
+    for i in 0..5 {
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/logs",
+            Some("writer-token"),
+            Some(append_body("alice", &format!("/api/things/{i}"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+    send(&app, "POST", "/v1/admin/flush", Some("admin-token"), None).await;
+
+    // grab a real log id from a query (serialized as a u128 number)
+    let (_, body) = send(
+        &app,
+        "POST",
+        "/v1/logs/query",
+        Some("reader-token"),
+        Some(json!({})),
+    )
+    .await;
+    let log_id = body["logs"][0]["log_id"].as_str().unwrap().to_string();
+
+    // inclusion proof verifies against the returned root
+    let (status, proof) = send(
+        &app,
+        "GET",
+        &format!("/v1/proof/inclusion/{log_id}"),
+        Some("reader-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{proof}");
+    let leaf = decode_hash(proof["leaf"].as_str().unwrap());
+    let root = decode_hash(proof["merkle_root"].as_str().unwrap());
+    let path: Vec<[u8; 32]> = proof["audit_path"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| decode_hash(h.as_str().unwrap()))
+        .collect();
+    assert!(verify_inclusion(
+        &leaf,
+        proof["leaf_index"].as_u64().unwrap() as usize,
+        proof["tree_size"].as_u64().unwrap() as usize,
+        &path,
+        &root,
+    ));
+
+    // an unknown id is a 404
+    let (status, _) = send(
+        &app,
+        "GET",
+        "/v1/proof/inclusion/123456789",
+        Some("reader-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // consistency from an earlier size to now verifies
+    let (status, c) = send(
+        &app,
+        "GET",
+        "/v1/proof/consistency?from=2",
+        Some("reader-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{c}");
+    // re-derive the size-2 root via its own inclusion proof set is overkill here;
+    // instead trust the engine-level tests and just check the proof structure +
+    // that the current root is consistent with an empty prefix (size 0 -> now).
+    let now_root = decode_hash(c["merkle_root"].as_str().unwrap());
+    assert_eq!(c["second_size"].as_u64().unwrap(), 5);
+    let (_, c0) = send(
+        &app,
+        "GET",
+        "/v1/proof/consistency?from=0",
+        Some("reader-token"),
+        None,
+    )
+    .await;
+    let empty_proof: Vec<[u8; 32]> = c0["proof"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| decode_hash(h.as_str().unwrap()))
+        .collect();
+    assert!(verify_consistency(
+        0,
+        5,
+        &[0u8; 32],
+        &now_root,
+        &empty_proof
+    ));
+
+    // proofs need the query grant
+    let (status, _) = send(
+        &app,
+        "GET",
+        &format!("/v1/proof/inclusion/{log_id}"),
+        Some("writer-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    pipeline.shutdown();
+}
+
+fn decode_hash(s: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    out
+}

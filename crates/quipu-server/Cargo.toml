@@ -15,8 +15,8 @@ readme = "README.md"
 all-features = true
 
 [dependencies]
-quipu-core = { path = "../quipu-core", version = "0.1.0" }
-quipu-middleware = { path = "../quipu-middleware", version = "0.1.0" }
+quipu-core = { path = "../quipu-core", version = "0.2.0" }
+quipu-middleware = { path = "../quipu-middleware", version = "0.2.0" }
 axum = { workspace = true }
 axum-server = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal"] }
