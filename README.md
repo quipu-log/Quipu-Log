@@ -199,7 +199,9 @@ Each hit returns the actor/target snapshots as recorded, plus an RFC 3339 UTC ti
 
 `contains()`:
 
-- **With an `Ngram(n)` index:** matches case-insensitively by token digest — no plaintext on disk. It checks that every n-gram of the query appears in the record, which is a *candidate* filter — the same fragments can occur without the full substring, so it can over-match. A field with `Rsa` *protection* then decrypts the candidates and re-checks the real value (needs `StoreConfig::plaintext_cache(true)`), making hits exact; a `Sha256`/`Hmac` field can't recover plaintext to re-check, so those over-matches remain as false positives. Want exact `contains()`? Give the field `Rsa` protection (a field protection, not a match operator).
+- **With an `Ngram(n)` index:** matches case-insensitively by token digest — no plaintext on disk. It checks that every n-gram of the query appears in the record: a *candidate* filter, so fragments occurring out of order can over-match. Whether that over-match is filtered out depends on the field's *protection* (not the operator):
+    - **`Rsa`:** candidates are decrypted and re-checked against the real value (needs `StoreConfig::plaintext_cache(true)`) → exact hits.
+    - **`Sha256` / `Hmac`:** no recoverable plaintext to re-check → the over-matches remain as false positives.
 - **Without an index:** needs `plaintext_cache(true)` (in memory, never persisted). Off by default → the query is rejected.
 
 ### Snapshots
