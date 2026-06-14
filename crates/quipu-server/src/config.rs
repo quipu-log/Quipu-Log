@@ -111,6 +111,12 @@ pub struct StoreSection {
 pub enum SyncPolicySpec {
     Always,
     EveryN(u32),
+    /// Group commit: fsync after `n` appends or `interval_ms` milliseconds,
+    /// whichever comes first. Maps to [`SyncPolicy::EveryNOrInterval`].
+    EveryNOrInterval {
+        n: u32,
+        interval_ms: u64,
+    },
     OsManaged,
 }
 
@@ -384,6 +390,9 @@ impl ServerConfig {
             cfg = cfg.sync_policy(match p {
                 SyncPolicySpec::Always => SyncPolicy::Always,
                 SyncPolicySpec::EveryN(n) => SyncPolicy::EveryN(n),
+                SyncPolicySpec::EveryNOrInterval { n, interval_ms } => {
+                    SyncPolicy::EveryNOrInterval(n, std::time::Duration::from_millis(interval_ms))
+                }
                 SyncPolicySpec::OsManaged => SyncPolicy::OsManaged,
             });
         }

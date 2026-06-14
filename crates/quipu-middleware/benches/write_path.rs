@@ -67,6 +67,10 @@ fn bench_emit_durable(c: &mut Criterion) {
     for (name, sync) in [
         ("emit_1k_flush/os_managed", SyncPolicy::OsManaged),
         ("emit_1k_flush/fsync_every_64", SyncPolicy::EveryN(64)),
+        (
+            "emit_1k_flush/group_1k_or_20ms",
+            SyncPolicy::EveryNOrInterval(1000, Duration::from_millis(20)),
+        ),
     ] {
         let b = pipeline(sync, 16384);
         g.bench_function(name, |bench| {

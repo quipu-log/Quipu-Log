@@ -264,78 +264,12 @@ Signed checkpoints plus external anchoring extend that to truncation and a full 
 
 ## Scaling out: sharded trees
 
-Each Merkle tree has one writer. To scale past a single writer's throughput, shard — run N independent trees:
+Each Merkle tree has one writer, so a single tree's throughput is a ceiling. To scale past it, shard — run N independent trees and route each tenant to one:
 
-- **Writes scale by sharding.** Partition by tenant. Each shard is an independent single-writer tree + registry + checkpoints, so N shards give ~N× write throughput. You give up a single global order across shards (rarely needed for an audit log). `quipu-middleware`'s `ShardRouter` routes writes to the owning shard and fans queries out, merging by timestamp.
+- **Writes scale by sharding.** Partition by tenant. Each shard is an independent single-writer tree + registry + checkpoints, so N shards give ~N× write throughput — until the shared device's fsync bandwidth saturates (PLP NVMe pushes that ceiling far out). You give up a single global order across shards (rarely needed for an audit log). `quipu-middleware`'s `ShardRouter` consistent-hashes writes to the owning shard, runs each shard's group commit in parallel, fans queries out merging by timestamp, and keeps a signed cross-shard anchor so tamper-evidence still spans every shard.
 - **Reads scale by replication.** Sealed segments are immutable, so they copy to any number of read-replica query nodes; only the active tail lags.
 - **Acceptance scales statelessly.** A stateless ingest front routes each request to its owning shard by `Idempotency-Key`.
-- **Resharding is add-only.** Trees can't be rebalanced: growth freezes existing shards (read-only) and routes new writes to new shards by consistent hashing. No record moves; a tenant's history spans its old and current shards, and reads cover both.
-
-Full model — shard key, ordering, resharding, read topology: [`docs/specs/horizontal-scaling`](docs/specs/horizontal-scaling/solution-design.md).
-
-A single shard is one process: while it's down, audit trails to it stall. Surviving an outage is the sender's job — `quipu-client` provides idempotent retransmission (one record per `Idempotency-Key`), preserves each event's `occurred_at`, and spools to local disk through an outage. Recover a failed node by cold standby, not live failover. See [quipu-client](crates/quipu-client/README.md) and [cold-standby failover](crates/quipu-server/README.md#cold-standby-failover).
-
-## Key management
-
-Protect a field with `Hmac` or `Rsa` and you take on key management. For an audit log a lost key isn't a cold cache — it's records you can no longer read or search.
-
-- **Rotation is cheap; re-keying is the exception.** `KeyRing` keys are versioned. Routine rotation adds a higher version for new writes while older versions stay loaded for old records. Run the offline `rekey` pass only after a key *leak*, to re-wrap RSA data so the leaked key can no longer read the store.
-- **Keep old keys indefinitely.** Old RSA public keys verify old checkpoints; old HMAC keys match old search tokens. HMAC fields can't be re-keyed (one-way), so a leaked HMAC key means its digests are exposed.
-- **A lost key is unrecoverable.** No escrow, no backdoor. Back the `KeyRing` up separately from the store and rehearse the restore.
-- **Separate the signing key for anchoring.** Checkpoint signatures stop a key-holding insider only if the private key lives off the data node (separate host, HSM, or KMS).
-
-Step-by-step rotation and re-key: [quipu-server README](crates/quipu-server/README.md#key-rotation).
-
-## Operational notes
-
-- **Permissions** — grant each role any of `Emit` / `Query` / `Administer`. One policy-wide switch sets the default for a role with no grants: deny-by-default or allow-by-default.
-- **Retention** — `RetentionPolicy::days(90)` deletes whole sealed segments (one `unlink`, no rewrites); registries are kept so old history still renders. `.with_max_bytes(n)` adds a size cap (age OR size; active segment never dropped). Integrity still verifies afterward.
-- **Durability** — `SyncPolicy::Always`, `EveryN(n)`, or `OsManaged`.
-- **Dead-letter queue** — events that exhaust retries park on disk, survive restarts, and replay with `handle.redrive_dlq(&admin_role)` (crash-safe, at-least-once, original occurrence time kept).
-- **Integrity audit** — `store.verify_integrity()` checks every record against its Merkle tree; `prove_inclusion` / `prove_consistency` issue third-party-checkable proofs.
-- **Key rotation** — versioned `KeyRing` keys; highest active, older for reading. After a leak the offline `rekey` pass re-wraps RSA data and appends a signed re-key event. Full procedure: [quipu-server README](crates/quipu-server/README.md#key-rotation).
-- **Backup** — sealed segments are immutable, so `rsync`/snapshot copies them while the daemon runs. `flush` first, then verify the copy with `verify_integrity()`.
-- **Disk-full** — defined behavior. Housekeeping warns below 1 GiB or 10% free (configurable). An ENOSPC write skips retries, routes to DLQ/fallback, and sets a latch that clears on the next successful write or recovered space.
-- **Observability** — writes reported via `tracing` and counted. `handle.metrics()` returns queue depth, DLQ size, write/retry/park/loss counters, and a latency histogram (lock-free). `quipu-server` exposes Prometheus on `GET /metrics` and health on `GET /v1/healthz`.
-- **Export & SIEM** — `POST /v1/logs/export` dumps query hits as NDJSON. An opt-in syslog mirror (RFC 5424/UDP) forwards every written event, best-effort, never back-pressuring the write path.
-- **Format versioning** — segment files start with a magic + version byte; layout changes ship as migrations.
-
-## Performance
-
-All figures below are **one Merkle tree, no sharding** — the throughput of a single writer. Sharding multiplies this (see [Scaling past one writer](#scaling-past-one-writer-tenant-sharding)). Write-path, `cargo bench -p quipu-middleware --bench write_path` (criterion 0.5). One actor, one target, small text payload. `flush()` waits for durability, so these are end-to-end figures. Apple M4, 16 GB RAM, NVMe SSD, macOS 15, rustc 1.96.0, release, single emitter thread:
-
-| configuration | durable throughput |
-|---|---|
-| `SyncPolicy::OsManaged` (flush to page cache) | ~56,000 events/s |
-| `SyncPolicy::EveryN(64)` (fsync every 64 appends) | ~4,800 events/s |
-
-Caller-side `emit()` latency, `EveryN(64)`, 32,768-slot queue, 200,000 events:
-
-| percentile | latency |
-|---|---|
-| p50 | 42 ns |
-| p99 | 10.7 ms |
-| p99.9 | 11.6 ms |
-
-p50 is a bounded-channel enqueue; the tail is backpressure (a full queue returns `QueueFull`). `OsManaged` removes the tail at the cost of trusting the OS page cache on power loss.
-
-### Projected throughput on other storage (model, not measured)
-
-The numbers above are on an Apple laptop, whose `F_FULLFSYNC` is genuinely durable but slow (~12 ms). Group commit makes `EveryN(N)` throughput fsync-bound: one batch costs `N × per-event CPU + one fsync`. From the measured baseline, per-event CPU ≈ 18 µs (so ~1.14 ms per 64-event batch) and the M4 fsync ≈ 12 ms. The table below holds CPU fixed and substitutes the durable-write latency of representative server storage (Linux `fdatasync`). These are **projections derived from the model above, not benchmarks** — treat them as order-of-magnitude until measured on the target.
-
-| storage (assumed fsync) | projected single-tree `EveryN(64)` durable throughput |
-|---|---|
-| enterprise local NVMe, power-loss-protected (~0.08 ms) | ~52,000 events/s |
-| cloud high-IOPS block, e.g. io2 Block Express (~0.5 ms) | ~39,000 events/s |
-| datacenter SATA SSD (~1.0 ms) | ~30,000 events/s |
-| cloud general-purpose SSD, e.g. gp3 / pd-ssd (~1.5 ms) | ~24,000 events/s |
-| throughput HDD / cold block, e.g. st1 (~8 ms) | ~7,000 events/s |
-
-`OsManaged` is page-cache-bound, so it stays near the ~56,000 events/s CPU ceiling across all of these. As fsync latency drops below the batch's CPU cost, `EveryN` converges on that same ceiling — which is why the fast-NVMe row sits just under it.
-
-### Scaling past one writer: tenant sharding
-
-A Merkle tree has a single writer, so the numbers above are a per-tree ceiling. To go higher, run N independent trees and route each tenant to one. `quipu-middleware`'s `ShardRouter` does this: consistent-hash routing by tenant, per-shard group commit running in parallel, and a signed cross-shard anchor so tamper-evidence still spans every shard. Throughput scales ~N× until the shared device's fsync bandwidth saturates (PLP NVMe pushes that ceiling far out). Note sharding scales *across* tenants, not within one — a single hot tenant still lands on one tree.
+- **Resharding is add-only.** Trees can't be rebalanced: growth freezes existing shards (read-only) and routes new writes to new shards by consistent hashing. No record moves; a tenant's history spans its old and current shards, and reads cover both. Freezing — read-only but still readable — is what preserves the single-writer-for-life guarantee.
 
 ```rust
 use quipu_core::{AuditStore, StoreConfig, SyncPolicy, default_actor_type, default_target_type};
@@ -369,9 +303,77 @@ router.emit(&role, tenant, event)?;     // routed to the tenant's owning shard
 router.query(&role, Some(tenant), q)?;  // reads that tenant (active + frozen shards)
 ```
 
-**Distribution is the caller's responsibility.** The router consistent-hashes whatever tenant key you pass and never rebalances by load — there is no "route to the least-busy shard." This is application-level partitioning, not dynamic load balancing. An even spread comes from your *key design*: one key per tenant spreads tenants evenly (by count, not volume), while a finer `tenant:substream` key spreads a single hot tenant's writes across shards (at the cost of only ordering within a substream). Whoever sets the tenant — typically a trusted auth layer deriving it from the request identity, not raw client input — owns that choice.
+**Distribution is the caller's responsibility.** The router consistent-hashes whatever tenant key you pass and never rebalances by load — there is no "route to the least-busy shard." This is application-level partitioning, not dynamic load balancing. Sharding scales *across* tenants, not within one: an even spread comes from your *key design* — one key per tenant spreads tenants evenly (by count, not volume), while a finer `tenant:substream` key spreads a single hot tenant's writes across shards (at the cost of only ordering within a substream). Whoever sets the tenant — typically a trusted auth layer deriving it from the request identity, not raw client input — owns that choice.
 
-Pick `n` to match write concurrency (~one shard per core is a sane start). The seed must stay constant and be persisted — the ring depends on it; after a restart, rebuild with `ShardMap::from_parts(active, frozen, seed)`. To rebalance, `freeze` a shard: it stops taking writes but stays readable, which is what preserves the single-writer-for-life guarantee. `ShardMap::new(1, seed)` is the degenerate single-shard case and behaves exactly like an unsharded store, so you can start at `n = 1` and grow later.
+Pick `n` to match write concurrency (~one shard per core is a sane start). The seed must stay constant and be persisted — the ring depends on it; after a restart, rebuild with `ShardMap::from_parts(active, frozen, seed)`. `ShardMap::new(1, seed)` is the degenerate single-shard case and behaves exactly like an unsharded store, so you can start at `n = 1` and grow later.
+
+A single shard is one process: while it's down, audit trails to it stall. Surviving an outage is the sender's job — `quipu-client` provides idempotent retransmission (one record per `Idempotency-Key`), preserves each event's `occurred_at`, and spools to local disk through an outage. Recover a failed node by cold standby, not live failover. See [quipu-client](crates/quipu-client/README.md) and [cold-standby failover](crates/quipu-server/README.md#cold-standby-failover).
+
+## Key management
+
+Protect a field with `Hmac` or `Rsa` and you take on key management. For an audit log a lost key isn't a cold cache — it's records you can no longer read or search.
+
+- **Rotation is cheap; re-keying is the exception.** `KeyRing` keys are versioned. Routine rotation adds a higher version for new writes while older versions stay loaded for old records. Run the offline `rekey` pass only after a key *leak*, to re-wrap RSA data so the leaked key can no longer read the store.
+- **Keep old keys indefinitely.** Old RSA public keys verify old checkpoints; old HMAC keys match old search tokens. HMAC fields can't be re-keyed (one-way), so a leaked HMAC key means its digests are exposed.
+- **A lost key is unrecoverable.** No escrow, no backdoor. Back the `KeyRing` up separately from the store and rehearse the restore.
+- **Separate the signing key for anchoring.** Checkpoint signatures stop a key-holding insider only if the private key lives off the data node (separate host, HSM, or KMS).
+
+Step-by-step rotation and re-key: [quipu-server README](crates/quipu-server/README.md#key-rotation).
+
+## Operational notes
+
+- **Permissions** — grant each role any of `Emit` / `Query` / `Administer`. One policy-wide switch sets the default for a role with no grants: deny-by-default or allow-by-default.
+- **Retention** — `RetentionPolicy::days(90)` deletes whole sealed segments (one `unlink`, no rewrites); registries are kept so old history still renders. `.with_max_bytes(n)` adds a size cap (age OR size; active segment never dropped). Integrity still verifies afterward.
+- **Durability** — `SyncPolicy::Always`, `EveryN(n)`, `EveryNOrInterval(n, dur)` (group commit: fsync after `n` appends *or* `dur` since the oldest unsynced append, whichever comes first), or `OsManaged`.
+- **Dead-letter queue** — events that exhaust retries park on disk, survive restarts, and replay with `handle.redrive_dlq(&admin_role)` (crash-safe, at-least-once, original occurrence time kept).
+- **Integrity audit** — `store.verify_integrity()` checks every record against its Merkle tree; `prove_inclusion` / `prove_consistency` issue third-party-checkable proofs.
+- **Key rotation** — versioned `KeyRing` keys; highest active, older for reading. After a leak the offline `rekey` pass re-wraps RSA data and appends a signed re-key event. Full procedure: [quipu-server README](crates/quipu-server/README.md#key-rotation).
+- **Backup** — sealed segments are immutable, so `rsync`/snapshot copies them while the daemon runs. `flush` first, then verify the copy with `verify_integrity()`.
+- **Disk-full** — defined behavior. Housekeeping warns below 1 GiB or 10% free (configurable). An ENOSPC write skips retries, routes to DLQ/fallback, and sets a latch that clears on the next successful write or recovered space.
+- **Observability** — writes reported via `tracing` and counted. `handle.metrics()` returns queue depth, DLQ size, write/retry/park/loss counters, and a latency histogram (lock-free). `quipu-server` exposes Prometheus on `GET /metrics` and health on `GET /v1/healthz`.
+- **Export & SIEM** — `POST /v1/logs/export` dumps query hits as NDJSON. An opt-in syslog mirror (RFC 5424/UDP) forwards every written event, best-effort, never back-pressuring the write path.
+- **Format versioning** — segment files start with a magic + version byte; layout changes ship as migrations.
+
+## Performance
+
+All figures below are **one Merkle tree, no sharding** — the throughput of a single writer. Sharding multiplies this (see [Scaling past one writer](#scaling-past-one-writer-tenant-sharding)). Write-path, `cargo bench -p quipu-middleware --bench write_path` (criterion 0.5). One actor, one target, small text payload. `flush()` waits for durability, so these are end-to-end figures. Apple M4, 16 GB RAM, NVMe SSD (APFS tempdir), macOS 26, rustc 1.96.0, release, single emitter thread:
+
+| configuration | durable throughput |
+|---|---|
+| `SyncPolicy::OsManaged` (flush to page cache) | ~34,000 events/s |
+| `SyncPolicy::EveryNOrInterval(1000, 20ms)` (group commit) | ~29,000 events/s |
+| `SyncPolicy::EveryN(64)` (fsync every 64 appends) | ~3,200 events/s |
+
+`EveryNOrInterval` is the throughput knob: batching the fsync over ~1000 appends (or a 20 ms window, whichever first) cuts fsync count ~16× and lands within ~85% of the page-cache ceiling while still fsyncing — a measured ~9× over the count-only `EveryN(64)`. The interval caps how long a durable-pending append waits under low load, which `EveryN` alone cannot bound.
+
+Caller-side `emit()` latency, `EveryN(64)`, 32,768-slot queue, 200,000 events:
+
+| percentile | latency |
+|---|---|
+| p50 | 42 ns |
+| p99 | 16.3 ms |
+| p99.9 | 19.3 ms |
+
+p50 is a bounded-channel enqueue; the tail is backpressure (a full queue returns `QueueFull`). `OsManaged` removes the tail at the cost of trusting the OS page cache on power loss.
+
+### Compared to immudb
+
+Head-to-head against [immudb](https://github.com/codenotary/immudb)'s synced append, **matched on the group-commit knobs** (20 ms window, 1,000-op cap) and run in the **same `rust:1` Docker container** (Linux, tempdir on the container filesystem) immudb was benchmarked in — the same `write_path` / `EveryNOrInterval(1000, 20ms)` bench as above.
+
+| metric | quipu `EveryNOrInterval(1000, 20ms)` | immudb `SyncedAppend` (matched) |
+|---|---|---|
+| durable throughput | **~163,000 /s** | ~38,800 /s |
+| time / op | 6.14 ms / 1,000 events | 257.9 ms / 10,000 txn |
+| mode | embedded (in-process) | embedded (in-process) |
+| commit window | 20 ms | 20 ms |
+| count cap | 1,000 | 1,000 (`MaxActiveTransactions`) |
+| concurrency | single writer (1) | 1,000 goroutines |
+| work per commit | multi-record append (log + relations + registry) + Merkle hash-tree leaf | multi-key append + AHT leaf (MVCC; secondary index built async) |
+| relative | **4.2×** | 1.0× (baseline) |
+
+This is an apples-to-apples comparison of the same durable-write primitive: both group-commit a multi-record durable append anchored in a tamper-evidence hash tree (quipu a Merkle spine, immudb its accumulate-hash-tree), and immudb's secondary index is built asynchronously, off this path. Matched on the group-commit knobs (20 ms / 1,000) in the same container, quipu sustains **~4.2×** immudb's durable write throughput. The two are different designs — quipu a single-writer append-only audit log, immudb a general MVCC transactional KV store — but on the durable-write path they share, quipu's Rust append is markedly faster.
+
+A Merkle tree is single-writer, so the figures above are a per-tree ceiling. To scale past one tree, shard by tenant and run N in parallel — see [Scaling out: sharded trees](#scaling-out-sharded-trees).
 
 ## Workspace layout
 

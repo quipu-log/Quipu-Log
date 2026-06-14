@@ -27,6 +27,17 @@ pub enum SyncPolicy {
     Always,
     /// fsync after every N appends; otherwise only flush to the OS cache.
     EveryN(u32),
+    /// Group commit: fsync when *either* N appends have accumulated *or*
+    /// `interval` has elapsed since the oldest unsynced append — whichever
+    /// comes first. The count bounds batch size (throughput); the interval
+    /// bounds how long a durable-pending append can wait (the `EveryN`
+    /// failure mode is a quiet log stalling just shy of N for an unbounded
+    /// time). Ports immudb's "max-waitees OR sync-frequency" group commit.
+    ///
+    /// The interval is checked on each append, so it caps latency under
+    /// steady/moderate load; a fully idle store relies on the writer thread's
+    /// housekeeping fsync to drain the last sub-N batch.
+    EveryNOrInterval(u32, std::time::Duration),
     /// Never fsync explicitly; rely on the OS to write back. Fastest.
     OsManaged,
 }
@@ -227,6 +238,11 @@ pub struct AuditStore {
     custom_columns: HashMap<String, CustomColumnDef>,
     checkpoints: CheckpointLog,
     appends_since_sync: u32,
+    /// When the oldest currently-unsynced append landed. `Some` only between
+    /// a flush-without-sync and the next `sync_all`; drives the interval arm
+    /// of [`SyncPolicy::EveryNOrInterval`]. `Instant` is monotonic, so this
+    /// is immune to wall-clock jumps.
+    oldest_unsynced_at: Option<std::time::Instant>,
     /// Advisory OS lock on `root/LOCK`, held for the store's lifetime. The
     /// store is single-process by design; without this, a second process
     /// opening the same root would silently corrupt in-memory indexes and
@@ -294,6 +310,7 @@ impl AuditStore {
             custom_columns,
             checkpoints,
             appends_since_sync: 0,
+            oldest_unsynced_at: None,
             _lock: lock,
         })
     }
@@ -593,6 +610,18 @@ impl AuditStore {
                     self.relations.flush()?;
                 }
             }
+            SyncPolicy::EveryNOrInterval(n, interval) => {
+                self.appends_since_sync += 1;
+                let now = std::time::Instant::now();
+                // mark the start of this unsynced batch on its first append
+                let batch_start = *self.oldest_unsynced_at.get_or_insert(now);
+                if self.appends_since_sync >= n || now.duration_since(batch_start) >= interval {
+                    self.sync_all()?;
+                } else {
+                    self.logs.flush()?;
+                    self.relations.flush()?;
+                }
+            }
             SyncPolicy::OsManaged => {
                 self.logs.flush()?;
                 self.relations.flush()?;
@@ -611,6 +640,7 @@ impl AuditStore {
         self.logs.sync()?;
         self.relations.sync()?;
         self.appends_since_sync = 0;
+        self.oldest_unsynced_at = None;
         Ok(())
     }
 
@@ -1484,5 +1514,68 @@ impl ReadSnapshot {
             Some(rec) => snapshot_of(rec),
             None => missing_snapshot(entity_type, uid),
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_policy_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn store(root: &std::path::Path, policy: SyncPolicy) -> AuditStore {
+        let cfg = StoreConfig::new(root).sync_policy(policy);
+        let mut s = AuditStore::open(cfg).unwrap();
+        s.define_type(crate::default_actor_type()).unwrap();
+        s
+    }
+
+    fn append_one(s: &mut AuditStore) {
+        s.append(
+            "default_actor",
+            &EntityInput::new("u-1").text("name", "a"),
+            "POST",
+            "/x",
+            Content::Text("p".into()),
+            &[],
+            BTreeMap::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn group_commit_count_arm_resets_at_n() {
+        let dir = tempfile::tempdir().unwrap();
+        // huge interval so only the count arm can fire
+        let mut s = store(
+            dir.path(),
+            SyncPolicy::EveryNOrInterval(4, Duration::from_secs(3600)),
+        );
+        for _ in 0..3 {
+            append_one(&mut s);
+        }
+        // 3 appends: still pending, batch start recorded
+        assert_eq!(s.appends_since_sync, 3);
+        assert!(s.oldest_unsynced_at.is_some());
+        // 4th append hits N -> sync_all resets both
+        append_one(&mut s);
+        assert_eq!(s.appends_since_sync, 0);
+        assert!(s.oldest_unsynced_at.is_none());
+    }
+
+    #[test]
+    fn group_commit_interval_arm_fires_before_n() {
+        let dir = tempfile::tempdir().unwrap();
+        // tiny interval, large N: the interval arm must drive the fsync
+        let mut s = store(
+            dir.path(),
+            SyncPolicy::EveryNOrInterval(10_000, Duration::from_millis(5)),
+        );
+        append_one(&mut s);
+        assert_eq!(s.appends_since_sync, 1);
+        std::thread::sleep(Duration::from_millis(10));
+        // next append sees the elapsed interval and syncs the whole batch
+        append_one(&mut s);
+        assert_eq!(s.appends_since_sync, 0);
+        assert!(s.oldest_unsynced_at.is_none());
     }
 }
