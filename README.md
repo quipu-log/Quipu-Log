@@ -10,14 +10,18 @@ English | [한국어](README.ko.md)
 
 **Tamper-evident audit logging for Rust services. Embedded in your process, no database.**
 
-Logs who did what, to which entity, through which API. Each log pins the entity versions current when it was written, so old logs stay searchable by the values that were true at the time.
+Logs who did what, to which entity, through which API.
 
-## What it does
+## What Quipu-Log gives you
 
-- **Tamper-evident.** Append-only storage on an RFC 6962 Merkle history tree. `verify_integrity()` catches in-place edits and swapped segments. Inclusion/consistency proofs are O(log n), checkable without the full log or trust in the operator.
-- **Versioned entities.** Actors and targets are typed, versioned records. A renamed entity is still found by its old name.
-- **No database.** The store is a directory over `std::fs`. No daemon, no dependency; a crash recovers by truncating the torn tail. Cost: you manage encryption keys ([Key management](#key-management)).
-- **Non-blocking writes.** Async pipeline: retries, disk-backed DLQ, fallback hook.
+Quipu-Log does one thing — audit logging — and that focus buys you:
+
+- **Nothing to operate.** The store is one ordinary directory managed with `std::fs` — no daemon, no separate DB engine, no external dependency. The log embeds *inside* your service process rather than standing *beside* it.
+- **Field-level, searchable encryption.** Each field picks its protection (plaintext / SHA-256 / keyed HMAC / RSA hybrid), and a blind index (exact / prefix / n-gram) lets you **search values whose plaintext never touched disk**. Find logs by SSN without storing the SSN in the clear.
+- **Write-only deployment.** Start the server without the RSA private key and protected fields are stored as ciphertext it can't read itself. A fully compromised server still can't recover the plaintext.
+- **Standard, vendor-neutral proofs.** The integrity backbone is an RFC 6962 (Certificate Transparency) Merkle tree. Inclusion and consistency proofs follow the RFC exactly, so a third party can verify your log with a checker written straight from the spec — not a scheme only this software understands.
+- **History keeps its context.** Actors and targets are versioned entities, and every log pins the versions current when it was written. Rename a user today and last month's logs still render the old name — and still find it.
+- **Writes don't wait on disk.** `emit` is non-blocking through an async pipeline with retries, a disk-backed DLQ, and a fallback hook you can wire to your pager. A `tower` layer captures HTTP requests with almost no code change.
 
 ## How it works
 
