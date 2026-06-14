@@ -212,7 +212,7 @@ Recording an access is a plain append (no query, so no self-reference loop). The
 
 ## What tamper-evidence covers
 
-Quipu-Log makes tampering *evident*; it doesn't make storage *immutable*. The Merkle tree on its own catches accidental corruption (torn write, bit rot, truncated tail) and naive tampering (a record edited in place, a segment swapped out): `verify_integrity()` reports the first break. A third party can also verify independently — an inclusion proof shows a record is in the log, a consistency proof shows the history stayed append-only, both O(log n) against a published root.
+Quipu-Log makes tampering *evident*. The Merkle tree on its own catches accidental corruption (torn write, bit rot, truncated tail) and naive tampering (a record edited in place, a segment swapped out): `verify_integrity()` reports the first break. A third party can also verify independently — an inclusion proof shows a record is in the log, a consistency proof shows the history stayed append-only, both O(log n) against a published root.
 
 Signed checkpoints plus external anchoring extend that to truncation and a full rebuild from scratch. Full threat model: [SECURITY.md](SECURITY.md).
 

@@ -212,7 +212,7 @@ let cfg = StoreConfig::new("./audit-data")
 
 ## 변조 감지가 잡는 것
 
-Quipu-Log는 변조를 *드러나게* 합니다. 저장을 *불변으로* 만들지는 않습니다. Merkle 트리 하나만으로 우발적 손상(쓰다 만 쓰기, 비트 부패, 잘린 꼬리)과 순진한 변조(제자리 수정, 바꿔치기된 세그먼트)를 잡습니다 — `verify_integrity()`가 첫 균열을 짚어냅니다. 또한 제3자가 독립 검증할 수 있습니다. inclusion proof는 레코드가 로그에 있음을, consistency proof는 이력이 append-only로 유지됐음을, 둘 다 O(log n)으로 공개된 루트에 대해 확인합니다.
+Quipu-Log는 변조를 *드러나게* 합니다. Merkle 트리 하나만으로 우발적 손상(쓰다 만 쓰기, 비트 부패, 잘린 꼬리)과 순진한 변조(제자리 수정, 바꿔치기된 세그먼트)를 잡습니다 — `verify_integrity()`가 첫 균열을 짚어냅니다. 또한 제3자가 독립 검증할 수 있습니다. inclusion proof는 레코드가 로그에 있음을, consistency proof는 이력이 append-only로 유지됐음을, 둘 다 O(log n)으로 공개된 루트에 대해 확인합니다.
 
 서명 체크포인트와 외부 앵커링은 이 범위를 꼬리 절단과 전체 재작성까지 넓힙니다. 전체 위협 모델: [SECURITY.md](SECURITY.md).
 
