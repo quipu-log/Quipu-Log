@@ -19,6 +19,8 @@ English | [한국어](README.ko.md)
 
 Logs who did what, to which entity, through which API.
 
+📖 **Deep dive:** [The Quipu-Log Book](https://draft-dhgo.github.io/quipu-log-textbook/) — a from-scratch guide to the internals: the filesystem storage engine, the Merkle integrity model, and searchable encryption.
+
 ## What Quipu-Log gives you
 
 Quipu-Log does one thing — audit logging — and that focus buys you:

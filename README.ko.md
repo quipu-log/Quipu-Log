@@ -19,6 +19,8 @@
 
 누가 어떤 API로 무엇에 무슨 일을 했는지 기록합니다.
 
+📖 **심화 해설:** [Quipu-Log 교과서](https://draft-dhgo.github.io/quipu-log-textbook/ko/) — 파일시스템 저장 엔진, 머클 무결성 모델, 검색 가능 암호화를 밑바닥부터 짚는 내부 구조 해설서.
+
 ## Quipu-Log가 주는 것
 
 Quipu-Log는 감사 로그라는 한 가지 일에 특화돼 있고, 그 집중이 다음을 줍니다.
