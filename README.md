@@ -199,7 +199,7 @@ Each hit returns the actor/target snapshots as recorded, plus an RFC 3339 UTC ti
 
 `contains()`:
 
-- **With an `Ngram(n)` index:** matches by token digest, case-insensitive, no plaintext. RSA candidates are decrypted and verified (`StoreConfig::plaintext_cache(true)`); hashed fields can't verify, so false positives are possible — use `Rsa` for exact hits.
+- **With an `Ngram(n)` index:** matches case-insensitively by token digest — no plaintext on disk. On a field with `Rsa` *protection*, candidates are then decrypted and re-checked against the real value (needs `StoreConfig::plaintext_cache(true)`), so hits are exact; a `Sha256`/`Hmac` field has no recoverable plaintext to re-check, so digest collisions can surface as false positives. Want exact `contains()`? Give the field `Rsa` protection (it's a field protection, not a match operator).
 - **Without an index:** needs `plaintext_cache(true)` (in memory, never persisted). Off by default → the query is rejected.
 
 ### Snapshots
