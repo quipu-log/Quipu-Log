@@ -15,7 +15,7 @@
 
 English | [한국어](README.ko.md)
 
-**Tamper-evident audit logging for Rust services. Embedded in your process, no database.**
+**Audit logging for Rust services — record once, query the same history from any angle.** Tamper-evident, embedded in your process, no database.
 
 Logs who did what, to which entity, through which API.
 
@@ -302,7 +302,7 @@ Step-by-step rotation and re-key: [quipu-server README](crates/quipu-server/READ
 
 ## Performance
 
-Write-path, `cargo bench -p quipu-middleware --bench write_path` (criterion 0.5). One actor, one target, small text payload. `flush()` waits for durability, so these are end-to-end figures. Apple M4, 16 GB RAM, NVMe SSD, macOS 15, rustc 1.96.0, release, single emitter thread:
+All figures below are **one Merkle tree, no sharding** — the throughput of a single writer. Sharding multiplies this (see [Scaling past one writer](#scaling-past-one-writer-tenant-sharding)). Write-path, `cargo bench -p quipu-middleware --bench write_path` (criterion 0.5). One actor, one target, small text payload. `flush()` waits for durability, so these are end-to-end figures. Apple M4, 16 GB RAM, NVMe SSD, macOS 15, rustc 1.96.0, release, single emitter thread:
 
 | configuration | durable throughput |
 |---|---|
@@ -318,6 +318,60 @@ Caller-side `emit()` latency, `EveryN(64)`, 32,768-slot queue, 200,000 events:
 | p99.9 | 11.6 ms |
 
 p50 is a bounded-channel enqueue; the tail is backpressure (a full queue returns `QueueFull`). `OsManaged` removes the tail at the cost of trusting the OS page cache on power loss.
+
+### Projected throughput on other storage (model, not measured)
+
+The numbers above are on an Apple laptop, whose `F_FULLFSYNC` is genuinely durable but slow (~12 ms). Group commit makes `EveryN(N)` throughput fsync-bound: one batch costs `N × per-event CPU + one fsync`. From the measured baseline, per-event CPU ≈ 18 µs (so ~1.14 ms per 64-event batch) and the M4 fsync ≈ 12 ms. The table below holds CPU fixed and substitutes the durable-write latency of representative server storage (Linux `fdatasync`). These are **projections derived from the model above, not benchmarks** — treat them as order-of-magnitude until measured on the target.
+
+| storage (assumed fsync) | projected single-tree `EveryN(64)` durable throughput |
+|---|---|
+| enterprise local NVMe, power-loss-protected (~0.08 ms) | ~52,000 events/s |
+| cloud high-IOPS block, e.g. io2 Block Express (~0.5 ms) | ~39,000 events/s |
+| datacenter SATA SSD (~1.0 ms) | ~30,000 events/s |
+| cloud general-purpose SSD, e.g. gp3 / pd-ssd (~1.5 ms) | ~24,000 events/s |
+| throughput HDD / cold block, e.g. st1 (~8 ms) | ~7,000 events/s |
+
+`OsManaged` is page-cache-bound, so it stays near the ~56,000 events/s CPU ceiling across all of these. As fsync latency drops below the batch's CPU cost, `EveryN` converges on that same ceiling — which is why the fast-NVMe row sits just under it.
+
+### Scaling past one writer: tenant sharding
+
+A Merkle tree has a single writer, so the numbers above are a per-tree ceiling. To go higher, run N independent trees and route each tenant to one. `quipu-middleware`'s `ShardRouter` does this: consistent-hash routing by tenant, per-shard group commit running in parallel, and a signed cross-shard anchor so tamper-evidence still spans every shard. Throughput scales ~N× until the shared device's fsync bandwidth saturates (PLP NVMe pushes that ceiling far out). Note sharding scales *across* tenants, not within one — a single hot tenant still lands on one tree.
+
+```rust
+use quipu_core::{AuditStore, StoreConfig, SyncPolicy, default_actor_type, default_target_type};
+use quipu_middleware::{
+    AuditPipeline, PermissionPolicy, PipelineConfig, ShardId, ShardMap, ShardRouter,
+};
+
+// One pipeline per shard, each rooted in its own directory.
+fn shard_pipeline(dir: &std::path::Path) -> AuditPipeline {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut store = AuditStore::open(
+        StoreConfig::new(dir).sync_policy(SyncPolicy::EveryN(256)),
+    ).unwrap();
+    store.define_type(default_actor_type()).unwrap();
+    store.define_type(default_target_type()).unwrap();
+    AuditPipeline::start(
+        store, dir.to_path_buf(),
+        PermissionPolicy::allow_all(), PipelineConfig::default(), None,
+    ).unwrap()
+}
+
+// Fixed seed — the routing ring derives from it, so persist it and never change it.
+const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+let n = 8;
+let shards = (0..n)
+    .map(|i| (ShardId(i), shard_pipeline(&data_root.join(ShardId(i).dir_name()))))
+    .collect();
+let router = ShardRouter::new(ShardMap::new(n, SEED), shards);
+
+router.emit(&role, tenant, event)?;     // routed to the tenant's owning shard
+router.query(&role, Some(tenant), q)?;  // reads that tenant (active + frozen shards)
+```
+
+**Distribution is the caller's responsibility.** The router consistent-hashes whatever tenant key you pass and never rebalances by load — there is no "route to the least-busy shard." This is application-level partitioning, not dynamic load balancing. An even spread comes from your *key design*: one key per tenant spreads tenants evenly (by count, not volume), while a finer `tenant:substream` key spreads a single hot tenant's writes across shards (at the cost of only ordering within a substream). Whoever sets the tenant — typically a trusted auth layer deriving it from the request identity, not raw client input — owns that choice.
+
+Pick `n` to match write concurrency (~one shard per core is a sane start). The seed must stay constant and be persisted — the ring depends on it; after a restart, rebuild with `ShardMap::from_parts(active, frozen, seed)`. To rebalance, `freeze` a shard: it stops taking writes but stays readable, which is what preserves the single-writer-for-life guarantee. `ShardMap::new(1, seed)` is the degenerate single-shard case and behaves exactly like an unsharded store, so you can start at `n = 1` and grow later.
 
 ## Workspace layout
 
