@@ -197,12 +197,15 @@ Each hit returns the actor/target snapshots as recorded, plus an RFC 3339 UTC ti
 
 `exact`, `contains()`, `prefix()`, `exact_ci()` (case-insensitive exact). On plain fields all four work. On protected fields, `prefix()`/`exact_ci()` need the matching `FieldIndex` declared.
 
-`contains()`:
+`contains()` on a protected field needs a blind index:
 
-- **With an `Ngram(n)` index:** matches case-insensitively by token digest — no plaintext on disk. It checks that every n-gram of the query appears in the record: a *candidate* filter, so fragments occurring out of order can over-match. Whether that over-match is filtered out depends on the field's *protection* (not the operator):
-    - **`Rsa`:** candidates are decrypted and re-checked against the real value (needs `StoreConfig::plaintext_cache(true)`) → exact hits.
-    - **`Sha256` / `Hmac`:** no recoverable plaintext to re-check → the over-matches remain as false positives.
+- **With an `Ngram(n)` index:** `Sha256` / `Hmac` / `Rsa` all become searchable by token digest (case-insensitive, no plaintext on disk). The match is a *candidate* filter — it only confirms every n-gram of the query is present, so fragments occurring out of order can over-match. **Don't index a low-entropy field this way** (SSN, phone number, a name from a small set): a key-holder — including a compromised server — can dictionary-attack the digests and rebuild the value even when it's `Rsa`-encrypted (see [Blind indexes](#blind-indexes)).
 - **Without an index:** needs `plaintext_cache(true)` (in memory, never persisted). Off by default → the query is rejected.
+
+Whether those candidate over-matches are filtered out is set by the field *protection*:
+
+- `Rsa`: candidates are decrypted and re-checked against the real value (needs `StoreConfig::plaintext_cache(true)`) → no false positives.
+- `Sha256` / `Hmac`: still matches, but with no plaintext to re-check the over-matches stay in as false positives.
 
 ### Snapshots
 
