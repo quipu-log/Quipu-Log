@@ -21,6 +21,34 @@ Logs who did what, to which entity, through which API.
 
 📖 **Deep dive:** [The Quipu-Log Book](https://quipu-log.github.io/quipu-log-textbook/) — a from-scratch guide to the internals: the filesystem storage engine, the Merkle integrity model, and searchable encryption.
 
+## Quick start
+
+```sh
+cargo add quipu-core quipu-middleware
+```
+
+```rust
+use quipu_core::*;
+use quipu_middleware::*;
+
+let root = "/var/lib/myapp/audit";
+let mut store = AuditStore::open(StoreConfig::new(root))?;   // open or create
+store.define_type(default_actor_type())?;                    // built-in entity types
+store.define_type(default_target_type())?;
+
+let pipeline = AuditPipeline::start(
+    store, root.into(), PermissionPolicy::allow_all(), PipelineConfig::default(), None)?;
+let handle = pipeline.handle();                              // cloneable; a writer thread owns the store
+
+// non-blocking — records: actor svc-1 did PUT /api/docs/42 to target doc-42
+handle.emit(&Role::new("svc"), AuditEvent::new(
+    "default_actor", EntityInput::new("svc-1").text("name", "billing"),
+    "PUT", "/api/docs/42", Content::Text("saved".into()))
+    .target(TargetSpec::new("default_target", EntityInput::new("42").text("name", "doc-42"))))?;
+```
+
+Full runnable setup: [`examples/axum-demo`](examples/axum-demo) · [record from HTTP with a `tower` layer](#recording-from-http).
+
 ## What Quipu-Log gives you
 
 Quipu-Log does one thing — audit logging — and that focus buys you:
@@ -76,54 +104,6 @@ handle.query(&auditor, LogQuery {
 ```
 
 Query quality comes down to **how completely you attach relations at write time.** With the HTTP layer, encode "which entities to derive from this request" once in `target_extractor`, and every request records them consistently without anyone having to remember.
-
-## Quick start
-
-```sh
-cargo add quipu-core quipu-middleware
-```
-
-```rust
-use quipu_core::*;
-use quipu_middleware::*;
-
-// 1. Open (or create) a store.
-let root = std::path::PathBuf::from("/var/lib/myapp/audit");
-let cfg = StoreConfig::new(&root)
-    .retention(RetentionPolicy::days(90))
-    .sync_policy(SyncPolicy::EveryN(32));
-let mut store = AuditStore::open(cfg)?;
-
-// 2. Register entity types (the defaults work without custom schemas).
-if !store.has_type("default_actor") {
-    store.define_type(default_actor_type())?;
-    store.define_type(default_target_type())?;
-}
-
-// 3. Start the pipeline and keep a handle.
-let pipeline = AuditPipeline::start(
-    store, root, PermissionPolicy::allow_all(),
-    PipelineConfig::default(), None /* fallback hook */)?;
-let handle = pipeline.handle();
-
-// 4. Emit events — non-blocking.
-handle.emit(
-    &Role::new("svc"),
-    AuditEvent::new(
-        "default_actor",
-        EntityInput::new("svc-1").text("name", "billing-service"),
-        "PUT",
-        "/api/docs/42",
-        Content::Text("saved".into()),
-    )
-    .target(TargetSpec::new(
-        "default_target",
-        EntityInput::new("42").text("name", "doc-42"),
-    )),
-)?;
-```
-
-Full runnable setup: [`examples/axum-demo`](examples/axum-demo). HTTP services usually record via the layer below instead of emitting by hand.
 
 ## Recording from HTTP
 

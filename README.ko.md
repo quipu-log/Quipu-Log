@@ -21,6 +21,34 @@
 
 📖 **심화 해설:** [Quipu-Log 교과서](https://quipu-log.github.io/quipu-log-textbook/ko/) — 파일시스템 저장 엔진, 머클 무결성 모델, 검색 가능 암호화를 밑바닥부터 짚는 내부 구조 해설서.
 
+## 빠른 시작
+
+```sh
+cargo add quipu-core quipu-middleware
+```
+
+```rust
+use quipu_core::*;
+use quipu_middleware::*;
+
+let root = "/var/lib/myapp/audit";
+let mut store = AuditStore::open(StoreConfig::new(root))?;   // 열기(없으면 생성)
+store.define_type(default_actor_type())?;                    // 기본 엔티티 타입
+store.define_type(default_target_type())?;
+
+let pipeline = AuditPipeline::start(
+    store, root.into(), PermissionPolicy::allow_all(), PipelineConfig::default(), None)?;
+let handle = pipeline.handle();                              // 복제 가능; writer 스레드가 스토어 소유
+
+// 논블로킹 — 기록: actor svc-1이 PUT /api/docs/42를 target doc-42에 수행
+handle.emit(&Role::new("svc"), AuditEvent::new(
+    "default_actor", EntityInput::new("svc-1").text("name", "billing"),
+    "PUT", "/api/docs/42", Content::Text("saved".into()))
+    .target(TargetSpec::new("default_target", EntityInput::new("42").text("name", "doc-42"))))?;
+```
+
+전체 예제: [`examples/axum-demo`](examples/axum-demo) · [`tower` 레이어로 HTTP에서 기록](#http에서-기록하기).
+
 ## Quipu-Log가 주는 것
 
 Quipu-Log는 감사 로그라는 한 가지 일에 특화돼 있고, 그 집중이 다음을 줍니다.
@@ -76,54 +104,6 @@ handle.query(&auditor, LogQuery {
 ```
 
 조회 품질은 결국 **기록 시점에 연관을 얼마나 빠짐없이 걸었느냐**로 결정됩니다. HTTP 레이어를 쓴다면 `target_extractor`에 "이 요청에서 어떤 엔티티들을 연관으로 뽑을지"를 규칙으로 박아두면, 사람이 매번 빠뜨리지 않고 일관되게 기록됩니다.
-
-## 빠른 시작
-
-```sh
-cargo add quipu-core quipu-middleware
-```
-
-```rust
-use quipu_core::*;
-use quipu_middleware::*;
-
-// 1. 스토어를 연다 (없으면 생성).
-let root = std::path::PathBuf::from("/var/lib/myapp/audit");
-let cfg = StoreConfig::new(&root)
-    .retention(RetentionPolicy::days(90))
-    .sync_policy(SyncPolicy::EveryN(32));
-let mut store = AuditStore::open(cfg)?;
-
-// 2. 엔티티 타입 등록 (커스텀 스키마가 필요 없으면 기본 타입으로 충분).
-if !store.has_type("default_actor") {
-    store.define_type(default_actor_type())?;
-    store.define_type(default_target_type())?;
-}
-
-// 3. 파이프라인을 시작하고 핸들을 잡아둔다.
-let pipeline = AuditPipeline::start(
-    store, root, PermissionPolicy::allow_all(),
-    PipelineConfig::default(), None /* 폴백 훅 */)?;
-let handle = pipeline.handle();
-
-// 4. 이벤트 발행 — 논블로킹.
-handle.emit(
-    &Role::new("svc"),
-    AuditEvent::new(
-        "default_actor",
-        EntityInput::new("svc-1").text("name", "billing-service"),
-        "PUT",
-        "/api/docs/42",
-        Content::Text("saved".into()),
-    )
-    .target(TargetSpec::new(
-        "default_target",
-        EntityInput::new("42").text("name", "doc-42"),
-    )),
-)?;
-```
-
-전체 예제: [`examples/axum-demo`](examples/axum-demo). HTTP 서비스는 보통 emit을 직접 부르지 않고 아래 레이어로 기록합니다.
 
 ## HTTP에서 기록하기
 

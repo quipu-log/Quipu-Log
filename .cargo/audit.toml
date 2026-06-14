@@ -1,0 +1,9 @@
+# Advisories we have assessed and accept. Rationale and scope live in
+# SECURITY.md → "Known dependency advisories"; keep the two in sync.
+[advisories]
+ignore = [
+    # rsa crate — Marvin timing side-channel (key recovery). No fixed release
+    # upstream yet. Only reachable where the RSA private key actually decrypts
+    # (a client or a full server), never the public-key-only write-only server.
+    "RUSTSEC-2023-0071",
+]

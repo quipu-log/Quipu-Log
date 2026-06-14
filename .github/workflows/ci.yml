@@ -49,6 +49,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
 
+  # dependency vulnerability scan against the RustSec advisory DB; accepted
+  # advisories are listed (with rationale) in .cargo/audit.toml + SECURITY.md
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
   # short per-PR smoke: each fuzz target runs briefly so format/parser
   # regressions surface before merge; the long runs live in nightly.yml
   fuzz-smoke:
