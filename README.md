@@ -21,6 +21,7 @@ Quipu-Log does one thing — audit logging — and that focus buys you:
 - **Write-only deployment.** Start the server without the RSA private key and protected fields are stored as ciphertext it can't read itself. A fully compromised server still can't recover the plaintext.
 - **Standard, vendor-neutral proofs.** The integrity backbone is an RFC 6962 (Certificate Transparency) Merkle tree. Inclusion and consistency proofs follow the RFC exactly, so a third party can verify your log with a checker written straight from the spec — not a scheme only this software understands.
 - **History keeps its context.** Actors and targets are versioned entities, and every log pins the versions current when it was written. Rename a user today and last month's logs still render the old name — and still find it.
+- **Record once, query from any angle.** Attach every entity related to a change as a target, and the same history comes back whichever related entity you start from ([more](#record-once-query-from-any-angle)).
 - **Writes don't wait on disk.** `emit` is non-blocking through an async pipeline with retries, a disk-backed DLQ, and a fallback hook you can wire to your pager. A `tower` layer captures HTTP requests with almost no code change.
 
 ## How it works
