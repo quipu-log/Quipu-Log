@@ -1,0 +1,58 @@
+<svg width="460" height="160" viewBox="0 0 460 160" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Quipu-Log">
+  <title>Quipu-Log</title>
+  <defs>
+    <linearGradient id="badge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2230"/>
+      <stop offset="1" stop-color="#10151f"/>
+    </linearGradient>
+    <linearGradient id="cord" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e9edf2"/>
+      <stop offset="1" stop-color="#c4cdd8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ===== Logomark: a quipu (knotted cords) ===== -->
+  <g>
+    <!-- badge -->
+    <rect x="12" y="20" width="120" height="120" rx="30" fill="url(#badge)"/>
+    <rect x="12.5" y="20.5" width="119" height="119" rx="29.5" fill="none" stroke="#2c3647" stroke-width="1"/>
+
+    <!-- primary (top) cord — the root commitment the records hang from -->
+    <path d="M30 50 Q72 60 114 50" stroke="url(#cord)" stroke-width="5" stroke-linecap="round" fill="none"/>
+
+    <!-- pendant cords with knots (each knot = an appended, tamper-evident record) -->
+    <!-- strand 1 -->
+    <path d="M44 54 Q41 84 46 116" stroke="#9aa7b6" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <ellipse cx="42.7" cy="70" rx="6.2" ry="4.6" fill="#f5a623"/>
+    <ellipse cx="44.2" cy="96" rx="6.2" ry="4.6" fill="#f5a623"/>
+
+    <!-- strand 2 -->
+    <path d="M63 56 Q60 86 64 118" stroke="#9aa7b6" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <ellipse cx="61.4" cy="82" rx="6.2" ry="4.6" fill="#2dd4bf"/>
+
+    <!-- strand 3 -->
+    <path d="M82 56 Q79 86 83 118" stroke="#9aa7b6" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <ellipse cx="80.5" cy="68" rx="6.2" ry="4.6" fill="#f5a623"/>
+    <ellipse cx="80.9" cy="90" rx="6.2" ry="4.6" fill="#2dd4bf"/>
+    <ellipse cx="81.8" cy="110" rx="6.2" ry="4.6" fill="#f5a623"/>
+
+    <!-- strand 4 -->
+    <path d="M101 54 Q99 82 102 112" stroke="#9aa7b6" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <ellipse cx="99.6" cy="76" rx="6.2" ry="4.6" fill="#f5a623"/>
+
+    <!-- attachment nodes where pendants meet the primary cord -->
+    <g fill="#e9edf2">
+      <circle cx="43.5" cy="53" r="2.6"/>
+      <circle cx="62.2" cy="55" r="2.6"/>
+      <circle cx="81.2" cy="55" r="2.6"/>
+      <circle cx="100.3" cy="53" r="2.6"/>
+    </g>
+  </g>
+
+  <!-- ===== Wordmark ===== -->
+  <g font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif">
+    <text x="152" y="92" font-size="46" font-weight="700" letter-spacing="-0.5" fill="#14181f">quipu</text>
+    <text x="300" y="92" font-size="46" font-weight="400" letter-spacing="-0.5" fill="#f5a623" font-family="'SF Mono','JetBrains Mono',Menlo,Consolas,monospace">-log</text>
+    <text x="153" y="116" font-size="13.5" letter-spacing="2.2" fill="#6b7785" font-family="'SF Mono',Menlo,Consolas,monospace">TAMPER-EVIDENT AUDIT LOG</text>
+  </g>
+</svg>

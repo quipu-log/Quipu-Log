@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/quipu-log-logo-dark.png">
+    <img src="docs/logo/quipu-log-logo-light.png" alt="quipu-log — Tamper-evident audit log" width="440">
+  </picture>
+</p>
+
 # Quipu-Log
 
 [![CI](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml)
