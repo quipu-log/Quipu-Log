@@ -35,7 +35,7 @@ your handler ──emit──▶ pipeline ─────────▶ store (
 
 Your code holds a cloneable **handle**; a dedicated writer thread owns the store.
 
-## Pattern: attach the related entities, and every relevant CUD follows
+## Record once, query from any angle
 
 When you log a create/update/delete, **attach every entity related to that change as a target.** Then later, whichever of those entities you start from, the related change history comes back in one query.
 
