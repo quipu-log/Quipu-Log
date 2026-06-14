@@ -17,6 +17,8 @@ pub mod checkpoint;
 pub mod crypto;
 pub mod error;
 pub mod id;
+pub mod merkle;
+pub mod merkle_log;
 pub mod model;
 pub mod query;
 pub mod registry;
