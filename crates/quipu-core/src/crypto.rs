@@ -4,11 +4,13 @@ use crate::schema::FieldProtection;
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use hmac::{Hmac, Mac};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey};
 use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -173,8 +175,8 @@ impl KeyRing {
     /// demos and rotation drills — production should load persistent keys).
     pub fn with_generated_rsa(mut self, version: KeyVersion, bits: usize) -> Result<Self> {
         check_version(version)?;
-        let private = RsaPrivateKey::new(&mut rand::thread_rng(), bits)
-            .map_err(|e| Error::Crypto(e.to_string()))?;
+        let private =
+            RsaPrivateKey::new(&mut OsRng, bits).map_err(|e| Error::Crypto(e.to_string()))?;
         self.rsa.insert(
             version,
             RsaPair {
@@ -189,7 +191,7 @@ impl KeyRing {
     pub fn with_generated_hmac(mut self, version: KeyVersion) -> Result<Self> {
         check_version(version)?;
         let mut mac = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut mac);
+        OsRng.fill_bytes(&mut mac);
         self.macs.insert(version, mac);
         Ok(self)
     }
@@ -348,12 +350,14 @@ impl KeyRing {
                 let key = self.rsa_public_of(key_version)?;
                 // hybrid encryption: a fresh AES-256-GCM data key encrypts the
                 // value in one authenticated pass (no per-chunk RSA, no chunk
-                // reordering/truncation surface), then RSA-OAEP wraps the key
-                let mut dek = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut dek);
+                // reordering/truncation surface), then RSA-OAEP wraps the key.
+                // The DEK is the only plaintext-equivalent secret here, so it
+                // lives in a Zeroizing buffer that wipes it on drop.
+                let mut dek = Zeroizing::new([0u8; 32]);
+                OsRng.fill_bytes(dek.as_mut_slice());
                 let mut nonce = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut nonce);
-                let cipher = Aes256Gcm::new_from_slice(&dek).expect("32-byte key");
+                OsRng.fill_bytes(&mut nonce);
+                let cipher = Aes256Gcm::new_from_slice(dek.as_slice()).expect("32-byte key");
                 let ciphertext = cipher
                     .encrypt(
                         Nonce::from_slice(&nonce),
@@ -361,7 +365,7 @@ impl KeyRing {
                     )
                     .map_err(|e| Error::Crypto(e.to_string()))?;
                 let wrapped_key = key
-                    .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha256>(), &dek)
+                    .encrypt(&mut OsRng, Oaep::new::<Sha256>(), dek.as_slice())
                     .map_err(|e| Error::Crypto(e.to_string()))?;
                 Ok(StoredValue::Rsa {
                     key_version,
@@ -427,13 +431,15 @@ impl KeyRing {
         };
         let key = self.rsa_private_of(*key_version)?;
         let bad_b64 = || Error::Crypto("invalid base64".into());
-        let dek = key
-            .decrypt(
+        let dek = Zeroizing::new(
+            key.decrypt(
                 Oaep::new::<Sha256>(),
                 &b64::decode(wrapped_key).ok_or_else(bad_b64)?,
             )
-            .map_err(|e| Error::Crypto(e.to_string()))?;
-        let cipher = Aes256Gcm::new_from_slice(&dek).map_err(|e| Error::Crypto(e.to_string()))?;
+            .map_err(|e| Error::Crypto(e.to_string()))?,
+        );
+        let cipher =
+            Aes256Gcm::new_from_slice(dek.as_slice()).map_err(|e| Error::Crypto(e.to_string()))?;
         let nonce = b64::decode(nonce).ok_or_else(bad_b64)?;
         if nonce.len() != 12 {
             return Err(Error::Crypto("invalid nonce length".into()));
@@ -469,15 +475,16 @@ impl KeyRing {
         }
         let old = self.rsa_private_of(*key_version)?;
         let bad_b64 = || Error::Crypto("invalid base64".into());
-        let dek = old
-            .decrypt(
+        let dek = Zeroizing::new(
+            old.decrypt(
                 Oaep::new::<Sha256>(),
                 &b64::decode(wrapped_key).ok_or_else(bad_b64)?,
             )
-            .map_err(|e| Error::Crypto(e.to_string()))?;
+            .map_err(|e| Error::Crypto(e.to_string()))?,
+        );
         let wrapped = self
             .rsa_public_of(active)?
-            .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha256>(), &dek)
+            .encrypt(&mut OsRng, Oaep::new::<Sha256>(), dek.as_slice())
             .map_err(|e| Error::Crypto(e.to_string()))?;
         Ok(StoredValue::Rsa {
             key_version: active,

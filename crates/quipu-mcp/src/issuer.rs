@@ -14,6 +14,7 @@
 //! The issuer just names the role on the token; the grant lives in the
 //! server's `auth.grants`. See the crate README's scope design.
 
+use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -48,7 +49,7 @@ impl IssuedToken {
 /// high-entropy, so its `sha256` cannot be brute-forced off the config.
 pub fn issue(role: &str, expires: Option<u64>) -> IssuedToken {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     let token = hex(&bytes);
     let hashed_key = format!("sha256:{}", sha256_hex(&token));
     IssuedToken {
