@@ -1,7 +1,7 @@
 //! # quipu-mcp
 //!
 //! A [Model Context Protocol](https://modelcontextprotocol.io) server that puts
-//! a [Quipu-Log](https://github.com/draft-dhgo/Quipu-Log) audit store in front
+//! a [Quipu-Log](https://github.com/quipu-log/Quipu-Log) audit store in front
 //! of an LLM agent — an "AI auditor" that can search the log, walk an entity's
 //! history, and verify the store's integrity, all in natural language.
 //!

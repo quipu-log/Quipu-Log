@@ -20,8 +20,8 @@ edition = "2021"
 # is a breaking change for downstreams — see CHANGELOG.md's compatibility policy.
 rust-version = "1.89"
 license = "Apache-2.0"
-repository = "https://github.com/draft-dhgo/Quipu-Log"
-homepage = "https://github.com/draft-dhgo/Quipu-Log"
+repository = "https://github.com/quipu-log/Quipu-Log"
+homepage = "https://github.com/quipu-log/Quipu-Log"
 keywords = ["audit", "audit-log", "tamper-evident", "compliance", "logging"]
 categories = ["database-implementations", "cryptography", "web-programming"]
 

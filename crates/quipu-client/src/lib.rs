@@ -72,7 +72,7 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! [`quipu-server`]: https://github.com/draft-dhgo/Quipu-Log
+//! [`quipu-server`]: https://github.com/quipu-log/Quipu-Log
 
 pub mod client;
 pub mod event;
