@@ -32,9 +32,11 @@ fuzz_target!(|data: &[u8]| {
         }
         let _ = table.append(&b"post-recovery".to_vec(), 42);
         let _ = table.sync();
-        let _ = table.contains_chain_value(&[7u8; 32]);
+        // exercise the Merkle spine read paths (must never panic on recovered data)
+        let _ = table.root();
+        let _ = table.prove_consistency(0);
     }
 
     // 3. raw Segment recovery open must also never panic
-    drop(Segment::open(&seg_path, [0u8; 32]));
+    drop(Segment::open(&seg_path, 0));
 });
