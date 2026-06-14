@@ -7,7 +7,7 @@
 
 # Quipu-Log
 
-[![CI](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml)
+[![CI](https://github.com/quipu-log/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/quipu-log/Quipu-Log/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
 [![crates.io](https://img.shields.io/crates/v/quipu-core.svg)](https://crates.io/crates/quipu-core)
@@ -189,7 +189,7 @@ FieldDef::text("name").protection(FieldProtection::Rsa)
     .search(FieldIndex::Prefix(4)),     // + 최대 4자 접두사 일치
 ```
 
-쓰기 시점에 평문을 소문자로 정규화·토큰화·다이제스트해 레코드 옆에 저장합니다. `Exact`는 값 전체, `Prefix(n)`은 앞 1..=n자, `Ngram(n)`은 n자 윈도우. 토큰은 필드의 키를 따르므로 무차별 대입 여지는 늘지 않지만, *구조*(어떤 값들이 접두사·조각을 공유하는지)는 새어 나갑니다. 필드 단위, 전역 스위치 없음.
+쓰기 시점에 평문을 소문자로 정규화·토큰화·다이제스트해 레코드 옆에 저장합니다. `Exact`는 값 전체, `Prefix(n)`은 앞 1..=n자, `Ngram(n)`은 n자 윈도우. 토큰은 필드의 키를 따르므로 *외부인*은 무차별 대입할 수 없습니다 — 하지만 그 키를 쥔 쪽(검색하려면 키가 필요한, 장악당한 서버 포함)은 **저엔트로피** 값의 다이제스트를 사전공격해, 필드를 복호화하지 못해도 평문을 재구성할 수 있습니다. 특히 `Ngram`은 조각 단위로 값을 복원하므로 가장 취약합니다. 또한 *구조*(어떤 값들이 접두사·조각을 공유하는지)도 새어 나갑니다. 그러니 블라인드 인덱스 — 특히 `Ngram` — 는 저엔트로피 PII에 걸지 마세요. 필드 단위, 전역 스위치 없음.
 
 ### 스키마 진화
 

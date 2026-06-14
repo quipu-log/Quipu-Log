@@ -11,7 +11,7 @@ seriously and ask you to report privately first.
 private vulnerability reporting on this repository:
 
 > Security → Report a vulnerability
-> (`https://github.com/draft-dhgo/Quipu-Log/security/advisories/new`)
+> (`https://github.com/quipu-log/Quipu-Log/security/advisories/new`)
 
 If that is unavailable to you, open a minimal public issue that says only "I
 have a security report, please open a private channel" — with no details — and
@@ -71,3 +71,14 @@ the design — reports are most useful when they target the actual model:
 Out of scope: denial of service from an authenticated admin token, physical
 access to key files, and weaknesses in dependencies already tracked by their
 own advisories (report those upstream, and tell us so we can bump).
+
+## Known dependency advisories
+
+- **RUSTSEC-2023-0071** — the `rsa` crate (used for `Rsa` field protection) is
+  subject to the Marvin timing side-channel, a potential key-recovery attack;
+  no fixed release exists upstream yet. The side-channel is only reachable
+  where the RSA *private* key actually decrypts — a client or a full server,
+  never the hardened public-key-only (write-only) server, which holds no
+  private key. Mitigate by keeping RSA decryption off attacker-observable
+  timing oracles and using `Hmac` for fields that only need search. We will
+  bump as soon as upstream ships a fix.

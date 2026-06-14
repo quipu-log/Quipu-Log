@@ -7,7 +7,7 @@
 
 # Quipu-Log
 
-[![CI](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/draft-dhgo/Quipu-Log/actions/workflows/ci.yml)
+[![CI](https://github.com/quipu-log/Quipu-Log/actions/workflows/ci.yml/badge.svg)](https://github.com/quipu-log/Quipu-Log/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
 [![crates.io](https://img.shields.io/crates/v/quipu-core.svg)](https://crates.io/crates/quipu-core)
@@ -189,7 +189,7 @@ FieldDef::text("name").protection(FieldProtection::Rsa)
     .search(FieldIndex::Prefix(4)),     // + prefix match up to 4 chars
 ```
 
-At write time the plaintext is lowercased, tokenized, digested, and stored beside the record: whole value for `Exact`, first `1..=n` chars for `Prefix(n)`, n-char windows for `Ngram(n)`. Tokens use the field's own key, so they add no brute-force surface, but they leak *structure* (which values share a prefix or fragment). Per-field, no global switch.
+At write time the plaintext is lowercased, tokenized, digested, and stored beside the record: whole value for `Exact`, first `1..=n` chars for `Prefix(n)`, n-char windows for `Ngram(n)`. Tokens use the field's own key, so an *outsider* can't brute-force them — but anyone holding that key (including a compromised server, which needs it to search) can dictionary-attack the digests of a **low-entropy** value and reconstruct it even without decrypting the field; `Ngram` is the worst here, since it rebuilds a value fragment by fragment. They also leak *structure* (which values share a prefix or fragment). So keep blind indexes — `Ngram` especially — off low-entropy PII. Per-field, no global switch.
 
 ### Schema evolution
 
